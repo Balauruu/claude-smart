@@ -14,6 +14,8 @@ Each Claude Code session gets one file at
   attached by event order to the next Assistant turn
 - ``{"publish_attempt": {"start": N, "end": M}}`` — frozen retry boundary for
   one in-flight publish
+- ``{"publish_request": {"start": N, "request_id": "..."}}`` — response
+  identity reserved before retrieval and retained through publication
 
 The buffer exists for offline resilience: when reflexio is unreachable,
 Stop appends without publishing and the next successful hook drains.
@@ -24,14 +26,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-try:
-    import fcntl  # POSIX only — Windows hooks fall back to append-without-lock.
-except ImportError:  # pragma: no cover — non-POSIX platforms
-    fcntl = None  # type: ignore[assignment]
+from filelock import FileLock
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -157,12 +157,10 @@ def append_injected(session_id: str, entries: Iterable[dict[str, Any]]) -> None:
 
     path = injected_path(session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        if fcntl is not None:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            except OSError as exc:
-                _LOGGER.debug("flock failed on %s: %s", path, exc)
+    with (
+        FileLock(str(path) + ".lock", timeout=5),
+        path.open("a", encoding="utf-8") as fh,
+    ):
         for record in records:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -212,19 +210,17 @@ def read_injected(session_id: str) -> dict[str, dict[str, Any]]:
 def append(session_id: str, record: dict[str, Any]) -> None:
     """Append one JSON record to the session buffer. Creates the dir if needed.
 
-    Holds an exclusive ``flock`` on the buffer file across the write so
+    Holds an exclusive cross-platform file lock across the write so
     concurrent hooks (e.g. parallel ``PostToolUse`` fires) cannot interleave
     JSON lines when a payload exceeds the buffered-writer's flush size.
     """
     path = session_path(session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, ensure_ascii=False) + "\n"
-    with path.open("a", encoding="utf-8") as fh:
-        if fcntl is not None:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            except OSError as exc:
-                _LOGGER.debug("flock failed on %s: %s", path, exc)
+    with (
+        FileLock(str(path) + ".lock", timeout=5),
+        path.open("a", encoding="utf-8") as fh,
+    ):
         fh.write(line)
 
 
@@ -235,6 +231,71 @@ def mark_all_published(session_id: str) -> None:
     they cannot publish later if learning is re-enabled.
     """
     append(session_id, {"published_up_to": len(read_all(session_id))})
+
+
+def reserved_publish_requests(
+    records: list[dict[str, Any]],
+) -> list[tuple[int, str, int]]:
+    """Read durable response boundaries; buffer offsets are never wire fields."""
+    reservations: list[tuple[int, str, int]] = []
+    for index, record in enumerate(records):
+        marker = record.get("publish_request")
+        if not isinstance(marker, dict):
+            continue
+        start, request_id = marker.get("start"), marker.get("request_id")
+        if (
+            type(start) is int
+            and 0 <= start <= index
+            and isinstance(request_id, str)
+            and request_id
+        ):
+            reservations.append((start, request_id, index))
+    return reservations
+
+
+def reserve_publish_request_id(session_id: str) -> str:
+    """Reserve the next response's identity before search, under the buffer lock.
+
+    Searches during a frozen retry belong to a later response. A new user turn
+    also closes a cancelled turn, so its retrievals cannot migrate to a reply
+    to a different prompt.
+    """
+    path = session_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        FileLock(str(path) + ".lock", timeout=5),
+        path.open("a", encoding="utf-8") as fh,
+    ):
+        records = read_all(session_id)
+        published = published_record_offset(records)
+        frozen_end = pending_publish_end(records, published) or published
+        reservations = [
+            r for r in reserved_publish_requests(records) if r[0] >= published
+        ]
+        last_user = max(
+            (i for i, r in enumerate(records) if r.get("role") == "User"), default=-1
+        )
+        last_assistant = max(
+            (i for i, r in enumerate(records) if r.get("role") == "Assistant"),
+            default=-1,
+        )
+        if reservations:
+            start, request_id, marker_index = reservations[-1]
+            if start >= frozen_end and max(last_user, last_assistant) < marker_index:
+                return request_id
+        start = max(published, frozen_end, last_assistant + 1)
+        # A new prompt after an unanswered prompt closes that cancelled range.
+        # Otherwise retain bookkeeping between the watermark and the user turn.
+        if (reservations and last_user > reservations[-1][2]) or any(
+            r.get("role") == "User" for r in records[start:last_user]
+        ):
+            start = max(start, last_user)
+        request_id = str(uuid.uuid4())
+        fh.write(
+            json.dumps({"publish_request": {"start": start, "request_id": request_id}})
+            + "\n"
+        )
+        return request_id
 
 
 def read_all(session_id: str) -> list[dict[str, Any]]:
@@ -319,9 +380,7 @@ def published_record_offset(records: list[dict[str, Any]]) -> int:
     )
 
 
-def pending_publish_end(
-    records: list[dict[str, Any]], published: int
-) -> int | None:
+def pending_publish_end(records: list[dict[str, Any]], published: int) -> int | None:
     """Return the frozen end of the current publish attempt, if any."""
 
     for marker_index, record in enumerate(records[published:], start=published):
@@ -404,12 +463,11 @@ def unpublished_slice(
 
         refs = record.get("retrieved_learning_refs")
         if "role" not in record and isinstance(refs, list):
-            for value in refs:
-                ref = _wire_retrieved_ref(value)
-                if ref is None:
-                    skipped += 1
-                else:
-                    pending_refs.append(ref)
+            valid_refs = [
+                ref for value in refs if (ref := _wire_retrieved_ref(value)) is not None
+            ]
+            skipped += len(refs) - len(valid_refs)
+            pending_refs.extend(valid_refs)
             continue
 
         role = record.get("role")
@@ -445,9 +503,7 @@ def unpublished_slice(
         # rots every time a hook adds a record key, and a stricter server would
         # turn that rot into a publish failure this plugin's adapter swallows
         # without advancing its watermark.
-        turn = {
-            key: value for key, value in record.items() if key in _WIRE_FIELDS
-        }
+        turn = {key: value for key, value in record.items() if key in _WIRE_FIELDS}
         turn["role"] = role
         # NOTE: deliberately does NOT send `created_at`. Carrying the buffer's
         # `ts` across looks like an obvious improvement — the server otherwise
