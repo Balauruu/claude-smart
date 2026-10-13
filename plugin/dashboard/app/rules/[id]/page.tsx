@@ -1,4 +1,4 @@
-import Link from "next/link";
+import Link from "@/components/common/source-link";
 import { redirect } from "next/navigation";
 import { AlertTriangle, ArrowLeft } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
@@ -10,8 +10,10 @@ export const dynamic = "force-dynamic";
 
 export default async function RuleResolverPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ source?: string }>;
 }) {
   const { id: rawId } = await params;
   let id: string;
@@ -22,7 +24,11 @@ export default async function RuleResolverPage({
   }
   const resolved = await resolveRuleLink(id);
   if (resolved) {
-    redirect(resolved.href);
+    const { source } = await searchParams;
+    const target = new URL(resolved.href, "http://dashboard");
+    if (source === "local" || source === "managed")
+      target.searchParams.set("source", source);
+    redirect(`${target.pathname}${target.search}${target.hash}`);
   }
 
   return (

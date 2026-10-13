@@ -1,8 +1,9 @@
 "use client";
 
 import { use, useEffect, useMemo, useState } from "react";
-import Link from "next/link";
+import Link from "@/components/common/source-link";
 import { useRouter } from "next/navigation";
+import { useSettings } from "@/hooks/use-settings";
 import {
   ArrowLeft,
   Save,
@@ -65,7 +66,8 @@ const REVIEW_STATUS_META: Record<
 > = {
   pending: {
     label: "Auto generated",
-    description: "Auto-generated shared skill. It may be updated automatically.",
+    description:
+      "Auto-generated shared skill. It may be updated automatically.",
   },
   approved: {
     label: "Persisted",
@@ -84,6 +86,7 @@ export default function SharedSkillDetailPage({
 }) {
   const { id } = use(params);
   const router = useRouter();
+  const { source } = useSettings();
 
   const [playbook, setPlaybook] = useState<AgentPlaybook | null>(null);
   const [notFound, setNotFound] = useState(false);
@@ -140,15 +143,13 @@ export default function SharedSkillDetailPage({
     setSaving(true);
     setError(null);
     try {
-      await reflexio.updateAgentPlaybook(
-        {
-          agent_playbook_id: playbook.agent_playbook_id,
-          content: form.content,
-          trigger: form.trigger || null,
-          rationale: form.rationale || null,
-          playbook_status: form.playbookStatus,
-        },
-      );
+      await reflexio.updateAgentPlaybook({
+        agent_playbook_id: playbook.agent_playbook_id,
+        content: form.content,
+        trigger: form.trigger || null,
+        rationale: form.rationale || null,
+        playbook_status: form.playbookStatus,
+      });
       setPlaybook({
         ...playbook,
         content: form.content,
@@ -178,12 +179,10 @@ export default function SharedSkillDetailPage({
     setReviewingStatus(nextStatus);
     setError(null);
     try {
-      await reflexio.updateAgentPlaybook(
-        {
-          agent_playbook_id: playbook.agent_playbook_id,
-          playbook_status: nextStatus,
-        },
-      );
+      await reflexio.updateAgentPlaybook({
+        agent_playbook_id: playbook.agent_playbook_id,
+        playbook_status: nextStatus,
+      });
       setPlaybook((current) =>
         current ? { ...current, playbook_status: nextStatus } : current,
       );
@@ -200,7 +199,7 @@ export default function SharedSkillDetailPage({
     setDeleting(true);
     try {
       await reflexio.deleteAgentPlaybook(playbook.agent_playbook_id);
-      router.push("/skills");
+      router.push(`/skills?source=${source}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setDeleting(false);
@@ -271,11 +270,7 @@ export default function SharedSkillDetailPage({
                   <X className="h-3.5 w-3.5" />
                   Cancel
                 </Button>
-                <Button
-                  size="sm"
-                  onClick={save}
-                  disabled={saving || !dirty}
-                >
+                <Button size="sm" onClick={save} disabled={saving || !dirty}>
                   <Save className="h-3.5 w-3.5" />
                   {saving ? "Saving…" : "Save"}
                 </Button>
@@ -340,7 +335,10 @@ export default function SharedSkillDetailPage({
                   placeholder="e.g. When writing or running async Python tests."
                 />
               ) : (
-                <Prose text={playbook?.trigger ?? ""} muted={!playbook?.trigger} />
+                <Prose
+                  text={playbook?.trigger ?? ""}
+                  muted={!playbook?.trigger}
+                />
               )}
             </Section>
 
@@ -511,9 +509,7 @@ function Section({
           <Icon className="h-3.5 w-3.5 text-muted-foreground" />
           {title}
         </Label>
-        {hint && (
-          <span className="text-xs text-muted-foreground">{hint}</span>
-        )}
+        {hint && <span className="text-xs text-muted-foreground">{hint}</span>}
       </div>
       {children}
     </section>

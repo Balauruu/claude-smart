@@ -1,8 +1,9 @@
 "use client";
 
 import { use, useEffect, useMemo, useState } from "react";
-import Link from "next/link";
+import Link from "@/components/common/source-link";
 import { useRouter } from "next/navigation";
+import { useSettings } from "@/hooks/use-settings";
 import {
   ArrowLeft,
   Save,
@@ -43,6 +44,7 @@ export default function PreferenceDetailPage({
   const { id: rawId } = use(params);
   const id = decodeURIComponent(rawId);
   const router = useRouter();
+  const { source } = useSettings();
 
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [notFound, setNotFound] = useState(false);
@@ -84,13 +86,11 @@ export default function PreferenceDetailPage({
     setSaving(true);
     setError(null);
     try {
-      await reflexio.updateUserProfile(
-        {
-          user_id: profile.user_id,
-          profile_id: profile.profile_id,
-          content,
-        },
-      );
+      await reflexio.updateUserProfile({
+        user_id: profile.user_id,
+        profile_id: profile.profile_id,
+        content,
+      });
       setProfile({ ...profile, content });
       setEditing(false);
     } catch (e) {
@@ -104,10 +104,11 @@ export default function PreferenceDetailPage({
     if (!profile) return;
     setDeleting(true);
     try {
-      await reflexio.deleteUserProfile(
-        { user_id: profile.user_id, profile_id: profile.profile_id },
-      );
-      router.push("/preferences");
+      await reflexio.deleteUserProfile({
+        user_id: profile.user_id,
+        profile_id: profile.profile_id,
+      });
+      router.push(`/preferences?source=${source}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setDeleting(false);
@@ -338,7 +339,11 @@ export default function PreferenceDetailPage({
                       icon={FileText}
                       label="Request"
                       value={profile.generated_from_request_id}
-                      display={truncateId(profile.generated_from_request_id, 8, 4)}
+                      display={truncateId(
+                        profile.generated_from_request_id,
+                        8,
+                        4,
+                      )}
                     />
                   )}
                   {attribution && profile.generated_from_request_id && (
