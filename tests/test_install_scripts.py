@@ -58,6 +58,8 @@ def _isolated_env(tmp_path: Path) -> dict[str, str]:
     env["SHELL"] = "/bin/sh"
     env.pop("BASH_ENV", None)
     env.pop("ENV", None)
+    # Retention matrix cases supply their own policy, independent of the shell.
+    env.pop("REFLEXIO_ROW_LIMIT_INTERACTIONS", None)
     # These fixtures exercise the native per-agent workers and their rollback
     # contracts. The guided coordinator is covered separately in test_install_guide.
     env["CLAUDE_SMART_INSTALL_CHILD"] = "1"
@@ -90,6 +92,7 @@ def _write_bootstrap_uv(path: Path, *, mode: str) -> None:
         f"  cat > \"$PWD/.venv/bin/python\" <<'PYSH'\n"
         "#!/bin/sh\n"
         'if [ "$1" = "-P" ]; then shift; fi\n'
+        'case "$1" in */backend-inference-owner.py) [ "${CLAUDE_SMART_TEST_INFERENCE_OWNER:-}" != "exit" ] || exit 1; printf "%s\\n" "${CLAUDE_SMART_TEST_INFERENCE_OWNER:-colocated}"; exit 0 ;; esac\n'
         'if [ "$1" = "-" ] && [ "$2" = "onnxruntime" ] && [ -n "${CLAUDE_SMART_TEST_ONNXRUNTIME_IMPORT_STATUS:-}" ]; then\n'
         '  exit "$CLAUDE_SMART_TEST_ONNXRUNTIME_IMPORT_STATUS"\n'
         "fi\n"
@@ -471,7 +474,11 @@ def test_backend_service_forces_utf8_stdio_for_managed_backend() -> None:
 def test_backend_service_uses_prepared_venv_reflexio_cli() -> None:
     service = (REPO_ROOT / "plugin" / "scripts" / "backend-service.sh").read_text()
 
-    assert 'backend_python="$(claude_smart_plugin_python "$PLUGIN_ROOT")"' in service
+    assert 'claude_smart_prepare_backend_import_context "$PLUGIN_ROOT"' in service
+    assert (
+        'backend_python="$(claude_smart_plugin_python "$plugin_root")"'
+        in LIB.read_text()
+    )
     assert '"$backend_python" "$HERE/backend-python-runner.py"' in service
     assert "-- services start" in service
     assert 'uv run --project "$PLUGIN_ROOT" --no-sync --quiet' not in service
@@ -481,7 +488,7 @@ def test_backend_service_uses_prepared_venv_reflexio_cli() -> None:
         'uv pip install --project "$PLUGIN_ROOT" --python "$plugin_python" '
         '--quiet --reinstall --no-deps "$vendor"'
     ) in service
-    assert 'vendor_pythonpath="$VENDORED_REFLEXIO"' in service
+    assert 'vendor_pythonpath="$plugin_root/vendor/reflexio"' in LIB.read_text()
     assert 'verify_bundled_reflexio_import "$backend_python"' in service
     assert 'PYTHONPATH="$backend_pythonpath"' in service
 
@@ -740,7 +747,6 @@ def test_smart_install_repairs_local_env_defaults() -> None:
 
     assert 'touch "$REFLEXIO_ENV"' in script
     assert "CLAUDE_SMART_USE_LOCAL_CLI" in script
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" in script
     assert "CLAUDE_SMART_READ_ONLY=0" in script
     assert "CLAUDE_SMART_HOST=claude-code" in script
     assert "CLAUDE_SMART_USE_LOCAL_CLI=" in script.split("install_complete()", 1)[1]
@@ -1101,7 +1107,7 @@ def test_installer_mode_matches_runtime_resolution(
     # A local report must leave the local backend its provider defaults.
     if not installer_managed:
         assert "CLAUDE_SMART_USE_LOCAL_CLI=" in final_text, context
-        assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=" in final_text, context
+        assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in final_text, context
     if "REFLEXIO_URL" in final_text and "REFLEXIO_URL" not in file_text:
         assert re.search(r'^REFLEXIO_API_KEY="?[^"\s]', final_text, re.MULTILINE), (
             context
@@ -1234,8 +1240,11 @@ def test_no_code_path_uses_the_shared_reflexio_env_file() -> None:
     assert offenders == []
 
 
-def _run_setup_script(tmp_path: Path, stdin: str) -> subprocess.CompletedProcess[str]:
+def _run_setup_script(
+    tmp_path: Path, stdin: str, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = _isolated_env(tmp_path)
+    env.update(env_extra or {})
     env["CLAUDE_SMART_SETUP_NO_INSTALL"] = "1"
     return subprocess.run(
         ["/bin/bash", str(SETUP_CLAUDE_SMART)],
@@ -1255,7 +1264,7 @@ def test_setup_script_local_mode_creates_env(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     text = (tmp_path / ".claude-smart" / ".env").read_text()
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in text
 
 
@@ -1319,7 +1328,7 @@ def test_setup_script_local_mode_cleans_managed_keys(tmp_path: Path) -> None:
     assert "REFLEXIO_API_KEY" not in text
     assert "REFLEXIO_USER_ID" not in text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert "CLAUDE_SMART_READ_ONLY=1" in text
     assert 'CLAUDE_SMART_READ_ONLY="0"' not in text
 
@@ -1335,7 +1344,7 @@ def test_setup_script_local_mode_replaces_managed_only_env(tmp_path: Path) -> No
     text = env_path.read_text()
     assert "REFLEXIO_API_KEY" not in text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in text
 
 
@@ -1540,9 +1549,7 @@ def test_node_installer_ignores_stale_url_without_api_key(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     assert (
-        "CLAUDE_SMART_USE_LOCAL_CLI, "
-        "CLAUDE_SMART_USE_LOCAL_EMBEDDING, CLAUDE_SMART_READ_ONLY, "
-        "CLAUDE_SMART_HOST.\n"
+        "CLAUDE_SMART_USE_LOCAL_CLI, CLAUDE_SMART_READ_ONLY, REFLEXIO_ROW_LIMIT_INTERACTIONS, CLAUDE_SMART_HOST.\n"
     ) in result.stdout
     assert "Using local Reflexio backend at http://localhost:8071/." in result.stdout
     # ~/.reflexio/.env belongs to other Reflexio tools: never rewritten.
@@ -1550,7 +1557,7 @@ def test_node_installer_ignores_stale_url_without_api_key(tmp_path: Path) -> Non
     runtime_text = claude_smart_env_path.read_text()
     assert "REFLEXIO_URL" not in runtime_text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in runtime_text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in runtime_text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in runtime_text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in runtime_text
     assert "CLAUDE_SMART_HOST=opencode" in runtime_text
 
@@ -1592,7 +1599,7 @@ def test_node_installer_updates_existing_host_and_local_defaults(
     assert "CLAUDE_SMART_HOST=opencode" in text
     assert "CLAUDE_SMART_HOST=codex" not in text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=0" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert 'CLAUDE_SMART_READ_ONLY="1"' in text
 
 
@@ -3515,8 +3522,13 @@ def test_backend_service_verifies_bundled_reflexio_runtime_identity() -> None:
     assert "module.relative_to(vendor)" in backend
     assert "reflexio import resolved outside bundled vendor" in backend
     assert "bundled Reflexio import preflight failed" in backend
-    assert 'vendor_pythonpath="$VENDORED_REFLEXIO"' in backend
-    assert 'vendor_pythonpath="$VENDORED_REFLEXIO_FOR_PYTHON"' in backend
+    assert 'claude_smart_prepare_backend_import_context "$PLUGIN_ROOT"' in backend
+    shared = LIB.read_text()
+    assert 'vendor_pythonpath="$plugin_root/vendor/reflexio"' in shared
+    assert (
+        'vendor_pythonpath="$(claude_smart_to_windows_path "$vendor_pythonpath")"'
+        in shared
+    )
     assert (
         'verify_bundled_reflexio_import "$backend_python" "$backend_pythonpath" "$VENDORED_REFLEXIO_FOR_PYTHON"'
         in backend
@@ -4353,7 +4365,9 @@ def test_smart_install_locked_sync_success_does_not_refresh_lock(
     ]
 
 
-def test_smart_install_persists_local_embedding_override(tmp_path: Path) -> None:
+def test_smart_install_does_not_persist_retired_embedding_export(
+    tmp_path: Path,
+) -> None:
     _plugin_root, smart_install, env = _prepare_smart_install_sync_fixture(
         tmp_path,
         mode="fresh",
@@ -4371,7 +4385,7 @@ def test_smart_install_persists_local_embedding_override(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
     text = (tmp_path / ".claude-smart" / ".env").read_text()
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=0" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
 
 
 def test_smart_install_rerun_preserves_existing_host(tmp_path: Path) -> None:
@@ -4695,7 +4709,7 @@ def test_smart_install_repairs_reflexio_template_env_drift(tmp_path: Path) -> No
     env_text = reflexio_env.read_text()
     assert "OPENAI_API_KEY=" in env_text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in env_text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in env_text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in env_text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in env_text
     assert (tmp_path / "uv.log").read_text().count(
         "sync --locked --python 3.12 --quiet"
@@ -4720,7 +4734,8 @@ def test_backend_service_configures_shared_embedding_daemon() -> None:
     backend = (REPO_ROOT / "plugin" / "scripts" / "backend-service.sh").read_text()
 
     assert 'EMBEDDING_PORT="${EMBEDDING_PORT:-8072}"' in backend
-    assert "REFLEXIO_EMBEDDING_PROVIDER:-local_service" in backend
+    assert "REFLEXIO_EMBEDDING_PROVIDER:-local_service" not in backend
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in backend
     assert "export REFLEXIO_EMBEDDING_SERVICE_URL" not in backend
 
 
@@ -7436,8 +7451,10 @@ def test_node_installer_preserves_occupied_plugin_root(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("ownership", ["colocated", "attached", "invalid", "exit"])
 def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
     tmp_path: Path,
+    ownership: str,
 ) -> None:
     node = shutil.which("node")
     if not node:
@@ -7476,6 +7493,7 @@ def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
                 f"{fake_bin}:/bin:/usr/bin:{os.environ.get('PATH', '')}"
             ),
             "CLAUDE_SMART_TEST_ONNXRUNTIME_IMPORT_STATUS": "1",
+            "CLAUDE_SMART_TEST_INFERENCE_OWNER": ownership,
             "SHELL": "",
         }
     )
@@ -7483,7 +7501,7 @@ def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
         f"const installer = require({json.dumps(str(NODE_INSTALLER))});"
         f"installer.bootstrapPluginRuntime({json.dumps(str(plugin_root))}, "
         "{ patchCodexHooks: false })"
-        ".then(() => { console.error('unexpected success'); process.exit(1); })"
+        ".then(() => { process.exit(0); })"
         ".catch((err) => { console.error(err.message); process.exit(2); });"
     )
 
@@ -7497,11 +7515,20 @@ def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
     )
 
     marker = home / ".claude-smart" / "install-failed"
+    if ownership == "attached":
+        assert result.returncode == 0, result.stderr
+        assert not marker.exists()
+        return
     assert result.returncode == 2
-    assert "Windows local embedding requires Microsoft Visual C++" in result.stderr
+    expected = {
+        "colocated": "Windows local embedding requires Microsoft Visual C++",
+        "invalid": "Invalid inference ownership result",
+        "exit": "Unable to determine inference ownership",
+    }[ownership]
+    assert expected in result.stderr
     assert marker.exists()
     marker_text = marker.read_text()
-    assert "Windows local embedding requires Microsoft Visual C++" in marker_text
+    assert expected in marker_text
     assert "fingerprint=" in marker_text
     assert "verify-windows-embedding" in (home / "bash.log").read_text()
     npm_log = home / "npm.log"
@@ -8407,7 +8434,7 @@ def test_local_legacy_runtime_flags_migrate_without_connection_keys(
 ) -> None:
     legacy = tmp_path / ".reflexio" / ".env"
     legacy.parent.mkdir()
-    original = 'REFLEXIO_URL="http://localhost:8081/"\nREFLEXIO_API_KEY="other-server-key"\nCLAUDE_SMART_READ_ONLY="1"\nCLAUDE_SMART_CLI_TIMEOUT="90"\n'
+    original = 'REFLEXIO_URL="http://localhost:8081/"\nREFLEXIO_API_KEY="other-server-key"\nCLAUDE_SMART_READ_ONLY="1"\nCLAUDE_SMART_CLI_TIMEOUT="90"\nCLAUDE_SMART_USE_LOCAL_EMBEDDING=1\n'
     legacy.write_text(original)
     runtime = tmp_path / ".claude-smart" / ".env"
     if runtime_read_only is not None:
@@ -8431,6 +8458,7 @@ def test_local_legacy_runtime_flags_migrate_without_connection_keys(
     assert f'CLAUDE_SMART_READ_ONLY="{expected}"' in text
     assert 'CLAUDE_SMART_CLI_TIMEOUT="90"' in text
     assert "other-server-key" not in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert legacy.read_text() == original
 
 
@@ -8847,3 +8875,151 @@ def test_status_attributes_each_claude_registration_to_its_scope(
             in result.stdout
         )
         assert "Installed version: 3.0.0 (scope: user, enabled: true)" in result.stdout
+
+
+@pytest.mark.parametrize("saved", [None, "0", "4300"])
+@pytest.mark.parametrize("exported", [None, "9000"])
+def test_local_install_preserves_canonical_retention_budget(
+    tmp_path, monkeypatch, saved, exported
+):
+    from importlib.metadata import distribution
+
+    monkeypatch.setenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", "123456")
+    _plugin_root, installer, env = _prepare_smart_install_sync_fixture(
+        tmp_path, mode="fresh"
+    )
+    selected = tmp_path / ".claude-smart/.env"
+    selected.parent.mkdir(exist_ok=True)
+    original = "# keep policy\nUNKNOWN=keep\n"
+    if saved is not None:
+        original += f"REFLEXIO_ROW_LIMIT_INTERACTIONS={saved}\n"
+    selected.write_text(original)
+    if exported is not None:
+        env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+    result = _run_smart_install(installer, env)
+    assert result.returncode == 0, result.stderr
+    stored = saved if saved is not None else exported or "500"
+    text = selected.read_text()
+    assert original.strip() in text
+    assert text.count("REFLEXIO_ROW_LIMIT_INTERACTIONS=") == 1
+    assert f"REFLEXIO_ROW_LIMIT_INTERACTIONS={stored}" in text
+    backend = (REPO_ROOT / "plugin/scripts/backend-service.sh").read_text()
+    assert "INTERACTION_CLEANUP_THRESHOLD" not in backend
+    assert "INTERACTION_CLEANUP_DELETE_COUNT" not in backend
+    # Execute both real SDK policies, without starting compute or services.
+    probe = (
+        "from reflexio.cli.env_loader import block_implicit_dotenv_walkup, load_reflexio_env; "
+        "block_implicit_dotenv_walkup(); load_reflexio_env(); "
+        "from reflexio.server.services.storage.retention import get_row_retention_limits; "
+        "print(get_row_retention_limits()['interactions'])"
+    )
+    for sdk in (
+        REPO_ROOT / "plugin/vendor/reflexio",
+        Path(str(distribution("reflexio-ai").locate_file(""))),
+    ):
+        probe_env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "PYTHONPATH": str(sdk),
+            "REFLEXIO_ENV_FILE": str(selected),
+        }
+        if exported is not None:
+            probe_env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+        checked = subprocess.run(
+            [sys.executable, "-P", "-c", probe],
+            env=probe_env,
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        assert checked.returncode == 0, checked.stderr
+        assert checked.stdout.strip().splitlines()[-1] == (exported or stored)
+
+
+@pytest.mark.parametrize(
+    "installer", ["node-codex", "node-opencode", "python", "bash", "smart-install"]
+)
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        None,
+        "REFLEXIO_ROW_LIMIT_INTERACTIONS=0",
+        "REFLEXIO_ROW_LIMIT_INTERACTIONS=4300",
+        "REFLEXIO_ROW_LIMIT_INTERACTIONS = 0",
+        "  REFLEXIO_ROW_LIMIT_INTERACTIONS=4300",
+        '  export REFLEXIO_ROW_LIMIT_INTERACTIONS = "0"',
+    ],
+)
+@pytest.mark.parametrize("exported", [None, "9000"])
+def test_local_retention_defaults_preserve_dotenv_policy_across_installers(
+    tmp_path, monkeypatch, installer, assignment, exported
+):
+    from claude_smart.env_config import ensure_local_env_defaults, parse_env_line
+    from dotenv import dotenv_values
+    from io import StringIO
+
+    selected = tmp_path / ".claude-smart/.env"
+    selected.parent.mkdir()
+    original = "# policy\nUNKNOWN=keep\n" + (
+        assignment + "\n" if assignment is not None else ""
+    )
+    selected.write_text(original)
+    monkeypatch.setenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", "123456")
+    env = _isolated_env(tmp_path)
+    if exported is not None:
+        env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+    if installer.startswith("node-"):
+        host = installer.removeprefix("node-")
+        result = subprocess.run(
+            [
+                "node",
+                "-e",
+                f"require({str(NODE_INSTALLER)!r}).configureReflexioSetup({host!r})",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+    elif installer == "python":
+        if exported is None:
+            monkeypatch.delenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", raising=False)
+        else:
+            monkeypatch.setenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", exported)
+        ensure_local_env_defaults(selected, host="codex")
+        result = subprocess.CompletedProcess([], 0, "", "")
+    elif installer == "bash":
+        result = _run_setup_script(
+            tmp_path,
+            "codex\nlocal\n",
+            env_extra={"REFLEXIO_ROW_LIMIT_INTERACTIONS": exported}
+            if exported
+            else None,
+        )
+    else:
+        # This fixture prepares only its plugin/toolchain, retaining our saved policy.
+        _root, script, env = _prepare_smart_install_sync_fixture(tmp_path, mode="fresh")
+        if exported is not None:
+            env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+        result = _run_smart_install(script, env)
+    assert result.returncode == 0, result.stderr
+    text = selected.read_text()
+    assert original.strip() in text
+    parsed = [parse_env_line(line) for line in text.splitlines()]
+    caps = [
+        value
+        for pair in parsed
+        if pair is not None
+        for key, value in [pair]
+        if key == "REFLEXIO_ROW_LIMIT_INTERACTIONS"
+    ]
+    assert len(caps) == 1
+    expected = (
+        dotenv_values(stream=StringIO(original)).get("REFLEXIO_ROW_LIMIT_INTERACTIONS")
+        if assignment is not None
+        else exported or "500"
+    )
+    assert caps == [expected]
+    assert dotenv_values(selected)["REFLEXIO_ROW_LIMIT_INTERACTIONS"] == expected

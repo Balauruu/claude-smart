@@ -134,7 +134,7 @@ ensure_local_env_defaults() {
       key="${key#"${key%%[![:space:]]*}"}"
       key="${key#export }"
       key="${key%"${key##*[![:space:]]}"}"
-      if [[ "$key" =~ ^CLAUDE_SMART_[A-Z0-9_]+$ ]] && ! get_env_value "$key" >/dev/null 2>&1; then
+      if [[ "$key" =~ ^CLAUDE_SMART_[A-Z0-9_]+$ ]] && [ "$key" != "CLAUDE_SMART_USE_LOCAL_EMBEDDING" ] && ! get_env_value "$key" >/dev/null 2>&1; then
         # Preserve the encoded value; re-quoting doubles Windows backslashes.
         append_env_raw "$key" "${line#*=}"
       fi
@@ -155,9 +155,9 @@ ensure_local_env_defaults() {
     printf '# Route reflexio generation through the local Claude Code CLI\n' >> "$REFLEXIO_ENV"
     append_env_raw CLAUDE_SMART_USE_LOCAL_CLI "1"
   fi
-  if ! get_env_value CLAUDE_SMART_USE_LOCAL_EMBEDDING >/dev/null 2>&1; then
-    printf '# Use the in-process ONNX embedder (ONNX Runtime) - no API key for semantic search\n' >> "$REFLEXIO_ENV"
-    append_env_raw CLAUDE_SMART_USE_LOCAL_EMBEDDING "1"
+  if ! get_env_value REFLEXIO_ROW_LIMIT_INTERACTIONS >/dev/null 2>&1; then
+    printf '# Local interaction history row cap; 0 disables cap cleanup\n' >> "$REFLEXIO_ENV"
+    append_env_raw REFLEXIO_ROW_LIMIT_INTERACTIONS "${REFLEXIO_ROW_LIMIT_INTERACTIONS:-500}"
   fi
   if ! get_env_value CLAUDE_SMART_READ_ONLY >/dev/null 2>&1; then
     append_env_value CLAUDE_SMART_READ_ONLY "0"

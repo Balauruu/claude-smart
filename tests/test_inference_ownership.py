@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib.metadata import distribution
 import os
 from pathlib import Path
 import re
@@ -31,20 +32,102 @@ def _functions() -> str:
 
 
 @pytest.mark.parametrize("crlf", [False, True])
-@pytest.mark.parametrize("legacy", ["0", "1"])
 @pytest.mark.parametrize(
     "endpoint", [None, "http://127.0.0.1:9999", "https://owned.invalid"]
 )
-def test_health_and_cleanup_follow_real_sdk_ownership(tmp_path, legacy, endpoint, crlf):
-    _run_checks(tmp_path, legacy=legacy, endpoint=endpoint, failure=None, crlf=crlf)
+def test_health_and_cleanup_follow_real_sdk_ownership(tmp_path, endpoint, crlf):
+    _run_checks(tmp_path, legacy=None, endpoint=endpoint, failure=None, crlf=crlf)
 
 
 @pytest.mark.parametrize("failure", ["exit", "invalid"])
 def test_unknown_ownership_is_not_healthy_and_never_kills(tmp_path, failure):
-    _run_checks(tmp_path, legacy="1", endpoint=None, failure=failure)
+    _run_checks(tmp_path, legacy=None, endpoint=None, failure=failure)
 
 
-def _run_checks(tmp_path, *, legacy, endpoint, failure, crlf=False):
+@pytest.mark.parametrize("legacy", ["", "0", "1", "private-not-to-log"])
+@pytest.mark.parametrize(
+    "endpoint", [None, "http://127.0.0.1:9999", "https://owned.invalid"]
+)
+def test_retired_setting_fails_ownership_before_process_actions(
+    tmp_path, legacy, endpoint
+):
+    _run_checks(tmp_path, legacy=legacy, endpoint=endpoint, failure=None)
+
+
+@pytest.mark.parametrize("legacy", [None, "1"])
+def test_ownership_probe_also_supports_installed_sdk_baseline(tmp_path, legacy):
+    _run_checks(tmp_path, legacy=legacy, endpoint=None, failure=None, installed=True)
+
+
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "CLAUDE_SMART_USE_LOCAL_EMBEDDING",
+        "CLAUDE_SMART_USE_LOCAL_EMBEDDING=",
+        'CLAUDE_SMART_USE_LOCAL_EMBEDDING="  "',
+        "CLAUDE_SMART_USE_LOCAL_EMBEDDING=0",
+        "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1",
+        "CLAUDE_SMART_USE_LOCAL_EMBEDDING=\nPYTHON_DOTENV_DISABLED=yes",
+    ],
+)
+def test_selected_file_retired_keys_rejected_before_pruning(
+    tmp_path, installed, assignment
+):
+    _run_checks(
+        tmp_path,
+        legacy=None,
+        endpoint=None,
+        failure=None,
+        installed=installed,
+        file_assignment=assignment,
+    )
+
+
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize(
+    "assignment",
+    ["CLAUDE_SMART_USE_LOCAL_EMBEDDING=", "CLAUDE_SMART_USE_LOCAL_EMBEDDING"],
+)
+def test_disabled_dotenv_ignores_retired_file_keys(tmp_path, installed, assignment):
+    _run_checks(
+        tmp_path,
+        legacy=None,
+        endpoint="https://ignored.invalid",
+        failure=None,
+        installed=installed,
+        file_assignment=assignment,
+        disabled=True,
+    )
+
+
+def _run_checks(
+    tmp_path,
+    *,
+    legacy,
+    endpoint,
+    failure,
+    crlf=False,
+    installed=False,
+    file_assignment=None,
+    disabled=False,
+):
+    vendor = (
+        Path(str(distribution("reflexio-ai").locate_file("")))
+        if installed
+        else ROOT / "plugin" / "vendor" / "reflexio"
+    )
+    assert (vendor / "reflexio").is_dir(), (
+        "Materialize the selected SDK before this gate"
+    )
+    if installed:
+        assert not (vendor / "reflexio" / "removed_env.py").exists(), (
+            "Baseline compatibility requires the locked PyPI SDK, not an installed "
+            "vendor; run uv sync --project plugin --locked before this gate"
+        )
+    else:
+        assert (vendor / "reflexio" / "removed_env.py").is_file()
+
     calls = tmp_path / "queries"
     actions = tmp_path / "actions"
     python = tmp_path / "selected-python"
@@ -67,6 +150,7 @@ def _run_checks(tmp_path, *, legacy, endpoint, failure, crlf=False):
                     else ""
                 )
                 + "runpy.run_path(sys.argv[1], run_name='__main__')\n"
+                + f"assert Path(sys.modules['reflexio'].__file__).resolve().is_relative_to(Path({str(vendor)!r}).resolve())\n"
             )
         )
     )
@@ -77,20 +161,28 @@ def _run_checks(tmp_path, *, legacy, endpoint, failure, crlf=False):
         "REFLEXIO_EMBEDDING_DAEMON_HOST",
         "REFLEXIO_DISABLE_LOCAL_EMBEDDING_DAEMON",
         "PYTHON_DOTENV_DISABLED",
+        "CLAUDE_SMART_USE_LOCAL_EMBEDDING",
     ):
         env.pop(key, None)
     env.update(
         HOME=str(tmp_path),
         USERPROFILE=str(tmp_path),
         REFLEXIO_ENV_FILE=str(tmp_path / "selected.env"),
-        CLAUDE_SMART_USE_LOCAL_EMBEDDING=legacy,
         OWNED_ACTIONS=str(actions),
     )
-    # Endpoint comes from the same explicitly selected file the launcher reads.
-    if endpoint:
-        (tmp_path / "selected.env").write_text(
-            f"REFLEXIO_EMBEDDING_SERVICE_URL={endpoint}\n"
+    env["PYTHONPATH"] = os.pathsep.join([str(vendor), env.get("PYTHONPATH", "")])
+    if legacy is not None:
+        env["CLAUDE_SMART_USE_LOCAL_EMBEDDING"] = legacy
+    if disabled:
+        env["PYTHON_DOTENV_DISABLED"] = "yes"
+    # Endpoint and retired keys come from the actual SDK-selected file.
+    selected = tmp_path / "selected.env"
+    if endpoint or file_assignment is not None:
+        selected.write_text(
+            (f"REFLEXIO_EMBEDDING_SERVICE_URL={endpoint}\n" if endpoint else "")
+            + (file_assignment + "\n" if file_assignment is not None else "")
         )
+    before = selected.read_bytes() if selected.exists() else None
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
     foreign = tmp_path / "foreign"
@@ -126,14 +218,17 @@ def _run_checks(tmp_path, *, legacy, endpoint, failure, crlf=False):
         check=True,
     )
     assert calls.read_text().splitlines() == ["query"], result.stderr
-    if not endpoint:
-        assert not (tmp_path / "selected.env").exists()
+    assert (selected.read_bytes() if selected.exists() else None) == before
+    if before is None:
         assert not (tmp_path / ".reflexio").exists()
-    if failure:
+    if failure or legacy is not None or (file_assignment is not None and not disabled):
         assert result.stdout.splitlines() == ["failed"] * 3
+        if legacy is not None or file_assignment is not None:
+            assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" in result.stderr
+            assert "private-not-to-log" not in result.stderr
         assert "skipping embedding cleanup" in result.stderr
         assert not actions.exists()
-    elif endpoint:
+    elif endpoint and not disabled:
         assert result.stdout.splitlines() == ["ok"] * 3
         assert not actions.exists()
     else:

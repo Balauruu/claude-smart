@@ -63,7 +63,6 @@ const MANAGED_REFLEXIO_URL = "https://www.reflexio.ai/";
 const MANAGED_SETUP_ENV = "CLAUDE_SMART_MANAGED_SETUP";
 const CLAUDE_SMART_READ_ONLY_ENV = "CLAUDE_SMART_READ_ONLY";
 const CLAUDE_SMART_USE_LOCAL_CLI_ENV = "CLAUDE_SMART_USE_LOCAL_CLI";
-const CLAUDE_SMART_USE_LOCAL_EMBEDDING_ENV = "CLAUDE_SMART_USE_LOCAL_EMBEDDING";
 const CLAUDE_SMART_HOST_ENV = "CLAUDE_SMART_HOST";
 const LEARNING_PROVIDER_ENV = "CLAUDE_SMART_LEARNING_PROVIDER";
 const GUIDED_CONFIG_ENV = "CLAUDE_SMART_GUIDED_CONFIG";
@@ -147,17 +146,13 @@ const LOCAL_DEFAULT_ENV_ENTRIES = [
     CLAUDE_SMART_USE_LOCAL_CLI_ENV,
     "1",
   ],
-  [
-    "# Use the in-process ONNX embedder (ONNX Runtime) - no API key for semantic search",
-    CLAUDE_SMART_USE_LOCAL_EMBEDDING_ENV,
-    "1",
-  ],
   [null, CLAUDE_SMART_READ_ONLY_ENV, "0"],
+  ["# Local interaction history row cap; 0 disables cap cleanup", "REFLEXIO_ROW_LIMIT_INTERACTIONS", "500"],
   [null, CLAUDE_SMART_HOST_ENV, DEFAULT_CLAUDE_SMART_HOST],
 ];
 const ENV_OVERRIDABLE_LOCAL_DEFAULT_KEYS = new Set([
   CLAUDE_SMART_USE_LOCAL_CLI_ENV,
-  CLAUDE_SMART_USE_LOCAL_EMBEDDING_ENV,
+  "REFLEXIO_ROW_LIMIT_INTERACTIONS",
 ]);
 const LOCAL_MODE_PRUNE_KEYS = new Set([
   "REFLEXIO_URL",
@@ -478,7 +473,7 @@ function migrateLegacyManagedEnvOnce() {
   if (existsSync(LEGACY_REFLEXIO_ENV_PATH)) {
     for (const line of readFileSync(LEGACY_REFLEXIO_ENV_PATH, "utf8").split(/\r?\n/)) {
       const parsed = parseEnvLine(line);
-      if (parsed && /^CLAUDE_SMART_[A-Z0-9_]+$/.test(parsed.key) && !runtime.has(parsed.key)) {
+      if (parsed && /^CLAUDE_SMART_[A-Z0-9_]+$/.test(parsed.key) && parsed.key !== "CLAUDE_SMART_USE_LOCAL_EMBEDDING" && !runtime.has(parsed.key)) {
         runtimeLines.set(parsed.key, line);
       }
     }
@@ -1746,7 +1741,7 @@ function savedInstallConfiguration() {
   const env = readEnvFile(CLAUDE_SMART_ENV_PATH);
   const legacy = existsSync(LEGACY_ENV_MIGRATION_MARKER) ? new Map() : readEnvFile(LEGACY_REFLEXIO_ENV_PATH);
   for (const [key, value] of legacy) {
-    if (key.startsWith("CLAUDE_SMART_") && !env.has(key)) env.set(key, value);
+    if (key.startsWith("CLAUDE_SMART_") && key !== "CLAUDE_SMART_USE_LOCAL_EMBEDDING" && !env.has(key)) env.set(key, value);
   }
   const legacyKey = legacy.get("REFLEXIO_API_KEY");
   const legacyUrl = legacy.get("REFLEXIO_URL") || MANAGED_REFLEXIO_URL;
