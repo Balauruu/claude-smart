@@ -105,6 +105,24 @@ configuration rewrite or permanent conversion command is installed.
   library migration blindly to plugin startup, which already normalized modes.
 
 The newer bundled SDK rejects retired field names in saved organization JSON.
+The bundled startup runner prepares supported previous-generation local files
+before its strict SQLite identity check. It preserves the old agent optimizer
+switches' conjunction in `agent_playbooks_enabled`, keeps independent user
+consent and custom budgets, and writes format metadata outside the logical
+configuration API. Normal reads reject the retired pair. An ambiguous unmarked
+file already containing the formerly ignored new name requires deliberate
+offline conversion; startup must not infer consent from it.
+
+The path pin uses the SDK's locked raw file edit, preserving extensions and an
+already selected database. Its legacy-versus-derived SQLite selection is
+unchanged. The actual requested backend port is checked before preparation,
+including forwarded `--backend-port`; an occupied port leaves the file alone.
+Stop old writers before upgrading: this check is not a reservation or a
+cross-port writer detector. A failed preparation or identity pin now aborts
+startup, preventing an unpinned resolver from choosing an empty derived file
+beside existing history. Fix the saved policy/permissions and retry rather than
+continuing into another database.
+
 Untagged SQLite still selects SQLite. If startup reports historical aliases such
 as `storage_type`, use its existing
 offline `python -m reflexio.cli config upgrade-file INPUT --output COPY` command with
@@ -842,3 +860,33 @@ stable same-machine link or a separately managed server executable. This change
 does not repair an already-stale binding. The stable-link probe verifies helper
 execution after the normal link is refreshed, not a customer configuration
 migration or remote deployment.
+
+### Retrieval candidate budget
+
+The bundled SDK uses `retrieval_floor.candidate_pool_size`: zero disables
+cross-encoder flooring, and a positive value selects a candidate pool per search
+arm when the server reranker is available. Request top-k and recency pools can
+require more candidates. Other search thresholds remain independent.
+
+The server configuration page edits this budget directly, preserving nullable
+calibrated score floors, exact numeric overrides and opaque nested fields. It
+no longer turns a toggle into an arbitrary capacity or three fixed score values.
+An older connected server that does not return the canonical budget keeps the
+control disabled until upgraded; editing unrelated settings does not synthesize
+a new ignored candidate field for that server.
+
+SDK #813 owns local-file generation2 and targeted upgrades from generations0/1.
+The runner prepares before database identity pinning through the shared raw-file
+owner. Existing database selection, exact originals and inactive saved policies
+are preserved. An old-generation file already carrying the previously ignored
+candidate name requires deliberate explicit conversion. Publish/install of this
+plugin bundle is separate from source merge and is not performed by this change.
+
+
+The server settings editor uses the current singular `profile_extractor_config`
+and `user_playbook_extractor_config` objects. Editing a prompt preserves the
+other object fields; retired plural arrays are not interpreted as aliases. A
+blank or invalid candidate-budget edit blocks Save rather than disabling retrieval.
+Only explicit zero disables it. Help, stop and docs-only runner commands do not
+prepare, initialize, upgrade or pin a selected backend configuration; backend
+startup retains exact originals and database identity preparation.
