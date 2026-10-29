@@ -2731,6 +2731,17 @@ def test_commit_survives_an_undeletable_previous_package(tmp_path: Path) -> None
     assert "claude-smart installed and dependencies are prepared" in result.stdout
 
 
+def _seed_opencode_v2_loader(target: Path) -> Path:
+    """Write the generated V2 loader the installer would produce."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "// claude-smart OpenCode V2 loader\n"
+        "// OpenCode V2 auto-loads this directory. Reinstall claude-smart to refresh.\n"
+        'export { default } from "file:///tmp/claude-smart/plugin/opencode/dist/server.mjs";\n'
+    )
+    return target
+
+
 def test_node_opencode_uninstall_hands_the_host_back_to_claude_code(
     tmp_path: Path,
 ) -> None:
@@ -2756,6 +2767,8 @@ def test_node_opencode_uninstall_hands_the_host_back_to_claude_code(
     project.mkdir()
     (project / "opencode.json").write_text('{"plugin": []}\n')
     env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    project_loader = _seed_opencode_v2_loader(project / ".opencode" / "plugins" / "claude-smart.js")
 
     result = subprocess.run(
         [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode"],
@@ -2769,6 +2782,116 @@ def test_node_opencode_uninstall_hands_the_host_back_to_claude_code(
     assert result.returncode == 0, result.stderr
     assert link.resolve() == claude_root.resolve()
     assert 'CLAUDE_SMART_HOST="claude-code"' in runtime_env.read_text()
+    # Nothing else references the shared package, so uninstall removes it.
+    assert not project_loader.exists()
+    assert not opencode_root.exists()
+
+
+def test_node_opencode_project_uninstall_keeps_the_shared_package(
+    tmp_path: Path,
+) -> None:
+    # Both scopes share one package copy and every loader re-exports its
+    # server.mjs, so a project-scoped uninstall must not delete the package a
+    # surviving --global loader still imports.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Node installer test")
+    package_root = tmp_path / ".claude-smart" / "opencode" / "claude-smart" / "plugin"
+    (package_root / "scripts").mkdir(parents=True)
+    _write_executable(package_root / "scripts" / "backend-service.sh", "#!/bin/sh\nexit 0\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "opencode.json").write_text('{"plugin": []}\n')
+    project_loader = _seed_opencode_v2_loader(project / ".opencode" / "plugins" / "claude-smart.js")
+    env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    global_loader = _seed_opencode_v2_loader(tmp_path / "xdg" / "opencode" / "plugins" / "claude-smart.js")
+
+    result = subprocess.run(
+        [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode"],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not project_loader.exists()
+    assert global_loader.exists()
+    assert (package_root / "scripts" / "backend-service.sh").exists()
+
+
+def test_node_opencode_global_uninstall_keeps_the_shared_package(
+    tmp_path: Path,
+) -> None:
+    # The mirror case: a --global uninstall must not delete the package that a
+    # project loader in the same tree still imports.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Node installer test")
+    package_root = tmp_path / ".claude-smart" / "opencode" / "claude-smart" / "plugin"
+    (package_root / "scripts").mkdir(parents=True)
+    _write_executable(package_root / "scripts" / "backend-service.sh", "#!/bin/sh\nexit 0\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    project_loader = _seed_opencode_v2_loader(project / ".opencode" / "plugins" / "claude-smart.js")
+    env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    global_loader = _seed_opencode_v2_loader(tmp_path / "xdg" / "opencode" / "plugins" / "claude-smart.js")
+
+    result = subprocess.run(
+        [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode", "--global"],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not global_loader.exists()
+    assert project_loader.exists()
+    assert (package_root / "scripts" / "backend-service.sh").exists()
+
+
+def test_node_opencode_global_uninstall_reads_every_project_config_form(
+    tmp_path: Path,
+) -> None:
+    # A project can reference the shared package from a second config form that
+    # `opencodeConfigPath` does not pick: the object form, in .opencode, and in
+    # .jsonc. A --global uninstall must still see it and keep the package.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Node installer test")
+    package_root = tmp_path / ".claude-smart" / "opencode" / "claude-smart" / "plugin"
+    (package_root / "scripts").mkdir(parents=True)
+    _write_executable(package_root / "scripts" / "backend-service.sh", "#!/bin/sh\nexit 0\n")
+    (package_root / "opencode.json").write_text("{}\n")
+    project = tmp_path / "project"
+    (project / ".opencode").mkdir(parents=True)
+    # An unrelated root config takes precedence in opencodeConfigPath and hides it.
+    (project / "opencode.json").write_text('{"plugin": []}\n')
+    package_url = f"file://{package_root.parent}"
+    (project / ".opencode" / "opencode.jsonc").write_text(
+        '{\n  // object-form entry\n  "plugins": [{ "package": "%s" }]\n}\n' % package_url
+    )
+    env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    global_loader = _seed_opencode_v2_loader(tmp_path / "xdg" / "opencode" / "plugins" / "claude-smart.js")
+
+    result = subprocess.run(
+        [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode", "--global"],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not global_loader.exists()
+    assert (package_root / "scripts" / "backend-service.sh").exists()
 
 
 def test_windows_interrupt_ends_the_whole_child_tree(tmp_path: Path) -> None:
@@ -6787,6 +6910,8 @@ def _npm_install_global_tarball(
 
 def _install_opencode_tarball_fixture(
     tmp_path: Path,
+    foreign_global_loader: str | None = None,
+    log_service_calls: bool = False,
 ) -> tuple[Path, Path, Path, Path, dict[str, str], subprocess.CompletedProcess[str]]:
     if os.name == "nt":
         pytest.skip("tarball smoke uses POSIX npm bin paths")
@@ -6811,6 +6936,18 @@ def _install_opencode_tarball_fixture(
         '#!/bin/sh\nprintf "npm %s\\n" "$*" >> "$HOME/npm.log"\nexit 0\n',
     )
     _write_bootstrap_uv(uv_bin / "uv", mode="fresh")
+    if log_service_calls:
+        # Record service-script calls without running them, so the test never
+        # touches a real backend or dashboard on the host.
+        _write_executable(
+            fake_bin / "bash",
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            '  *-service.sh) printf "%s %s\\n" "$(basename "$1")" "$2" '
+            '>> "$HOME/service-calls.log"; exit 0 ;;\n'
+            "esac\n"
+            'exec /bin/bash "$@"\n',
+        )
 
     env = os.environ.copy()
     test_path = (
@@ -6828,6 +6965,11 @@ def _install_opencode_tarball_fixture(
         }
     )
     _npm_install_global_tarball(tarball, prefix=prefix, env=env)
+
+    if foreign_global_loader is not None:
+        loader = xdg / "opencode" / "plugins" / "claude-smart.js"
+        loader.parent.mkdir(parents=True, exist_ok=True)
+        loader.write_text(foreign_global_loader)
 
     result = subprocess.run(
         [
@@ -7279,13 +7421,20 @@ def test_opencode_fresh_tarball_install_uses_local_file_plugin(
 
     assert result.returncode == 0, result.stderr
     assert "claude-smart OpenCode support is installed." in result.stdout
-    config = json.loads((xdg / "opencode" / "opencode.json").read_text())
-    assert len(config["plugin"]) == 1
-    plugin_spec = config["plugin"][0]
-    assert plugin_spec.startswith("file://")
-    assert plugin_spec != "claude-smart"
+    # One load path: the global loader is written; no config entry is created.
+    assert not (xdg / "opencode" / "opencode.json").exists()
+    loader_text = (xdg / "opencode" / "plugins" / "claude-smart.js").read_text()
+    entry = json.loads(
+        loader_text.splitlines()[2]
+        .removeprefix("export { default } from ")
+        .removesuffix(";")
+    )
+    assert entry.startswith("file://")
+    assert entry != "claude-smart"
 
-    local_package = Path(plugin_spec.removeprefix("file://"))
+    local_package = Path(
+        entry.removeprefix("file://").removesuffix("/plugin/opencode/dist/server.mjs")
+    )
     installed_package = prefix / "lib" / "node_modules" / "claude-smart"
     local_script = local_package / "plugin" / "scripts" / "smart-install.sh"
     assert local_script.exists()
@@ -7301,6 +7450,40 @@ def test_opencode_fresh_tarball_install_uses_local_file_plugin(
     assert "uv sync --locked --python 3.12 --quiet" in (home / "uv.log").read_text()
 
 
+def test_opencode_tarball_install_conflict_fails_loudly(
+    tmp_path: Path,
+) -> None:
+    # A hand-written plugin squatting the loader path is a conflict: install
+    # must fail and must not claim the host is installed.
+    foreign = "// hand-written plugin, not a claude-smart loader\nexport default {};\n"
+    _home, _prefix, _project, xdg, _env, result = _install_opencode_tarball_fixture(
+        tmp_path, foreign_global_loader=foreign
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "claude-smart OpenCode support is installed." not in result.stdout
+    assert "not a claude-smart loader" in result.stderr
+    # The squatter is left untouched, not clobbered.
+    assert (xdg / "opencode" / "plugins" / "claude-smart.js").read_text() == foreign
+
+
+def test_opencode_tarball_install_conflict_leaves_shared_services_running(
+    tmp_path: Path,
+) -> None:
+    # The install started and stopped nothing, so a conflict must not stop a
+    # backend or dashboard that a global install is already running.
+    foreign = "// hand-written plugin, not a claude-smart loader\nexport default {};\n"
+    home, _prefix, _project, _xdg, _env, result = _install_opencode_tarball_fixture(
+        tmp_path, foreign_global_loader=foreign, log_service_calls=True
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "not a claude-smart loader" in result.stderr
+    calls = home / "service-calls.log"
+    logged = calls.read_text().splitlines() if calls.exists() else []
+    assert not [line for line in logged if line.endswith(" stop")], logged
+
+
 def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
     tmp_path: Path,
 ) -> None:
@@ -7310,8 +7493,15 @@ def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
     assert install_result.returncode == 0, install_result.stderr
 
     config_path = xdg / "opencode" / "opencode.json"
-    plugin_spec = json.loads(config_path.read_text())["plugin"][0]
-    local_package = Path(plugin_spec.removeprefix("file://"))
+    loader_path = xdg / "opencode" / "plugins" / "claude-smart.js"
+    entry = json.loads(
+        loader_path.read_text().splitlines()[2]
+        .removeprefix("export { default } from ")
+        .removesuffix(";")
+    )
+    local_package = Path(
+        entry.removeprefix("file://").removesuffix("/plugin/opencode/dist/server.mjs")
+    )
     assert local_package.exists()
 
     session_file = home / ".claude-smart" / "sessions" / "keep.jsonl"
@@ -7320,13 +7510,15 @@ def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
     reflexio_data.parent.mkdir(parents=True)
     session_file.write_text("{}\n")
     reflexio_data.write_text("keep\n")
+    # A legacy config still carries entries the uninstall must clean up.
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
         json.dumps(
             {
                 "plugin": [
                     "other-plugin",
                     "claude-smart",
-                    plugin_spec,
+                    local_package.as_uri(),
                 ],
                 "theme": "system",
             }
@@ -7355,6 +7547,9 @@ def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
         "plugin": ["other-plugin"],
         "theme": "system",
     }
+    # The loader must not stay behind: it re-exports the package just removed,
+    # so leaving it would break every later OpenCode start.
+    assert not loader_path.exists()
     assert not local_package.exists()
     assert not (home / ".claude-smart" / "opencode").exists()
     assert session_file.exists()
