@@ -807,7 +807,9 @@ fs.writeFileSync(
     stdin: fs.readFileSync(0, "utf8"),
     env: {{
       CLAUDE_SMART_HOST: process.env.CLAUDE_SMART_HOST,
-      CLAUDE_SMART_INTERNAL: process.env.CLAUDE_SMART_INTERNAL
+      CLAUDE_SMART_INTERNAL: process.env.CLAUDE_SMART_INTERNAL,
+      OPENCODE_PURE: process.env.OPENCODE_PURE,
+      PWD: process.env.PWD
     }}
   }})
 );
@@ -852,13 +854,19 @@ process.stdout.write(JSON.stringify({{
         "result": "bridge output",
     }
     call = json.loads(call_log.read_text())
-    assert call["env"] == {
-        "CLAUDE_SMART_HOST": "opencode",
-        "CLAUDE_SMART_INTERNAL": "1",
-    }
-    assert call["args"][:4] == ["run", "--pure", "--format", "json"]
+    assert call["env"]["CLAUDE_SMART_HOST"] == "opencode"
+    assert call["env"]["CLAUDE_SMART_INTERNAL"] == "1"
+    # Pure mode is set via env (not the rejected --pure flag) so the extractor
+    # subprocess skips the user's external plugins on hosts that honor it.
+    assert call["env"]["OPENCODE_PURE"] == "1"
+    # No `--pure` / `--dir`: `opencode run` rejects both. Isolation comes from
+    # cwd (which holds the temp .opencode/opencode.json defining AGENT_NAME),
+    # and $PWD is refreshed so opencode resolves the project root correctly.
+    assert call["args"][:3] == ["run", "--format", "json"]
     assert "--agent" in call["args"]
-    assert "--dir" in call["args"]
+    assert "--pure" not in call["args"]
+    assert "--dir" not in call["args"]
+    assert call["env"]["PWD"] == call["cwd"]
     assert call["dotConfigExists"] is True
     assert call["rootConfigExists"] is False
     assert "--model" not in call["args"]
@@ -963,6 +971,94 @@ def test_opencode_cli_bridge_pipes_large_prompt_via_stdin(tmp_path: Path) -> Non
     call = json.loads(call_log.read_text())
     assert prompt not in call["args"]
     assert call["stdinLength"] == len(prompt)
+
+
+def test_opencode_cli_bridge_failure_surfaces_error_event(tmp_path: Path) -> None:
+    if shutil_which_node() is None:
+        pytest.skip("node is not installed")
+    bridge = REPO_ROOT / "plugin" / "scripts" / "opencode-claude-compat.js"
+    fake_opencode = tmp_path / "opencode"
+    # >300 chars of events precede the error event, so the truncated-stdout
+    # fallback cannot carry its message.
+    padding = json.dumps({"type": "step_start", "noise": "n" * 400})
+
+    def run_bridge() -> subprocess.CompletedProcess[str]:
+        env = {
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+        env.pop("CLAUDE_SMART_OPENCODE_PATH", None)
+        return subprocess.run(
+            [
+                shutil_which_node() or "node",
+                str(bridge),
+                "-p",
+                "--output-format",
+                "stream-json",
+            ],
+            input="extract",
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    # 2.x shape: a warning-only stderr must not suppress the error event.
+    fake_opencode.write_text(
+        "#!/usr/bin/env node\n"
+        "process.stderr.write('warning: benign\\n');\n"
+        f"process.stdout.write({json.dumps(padding)} + '\\n');\n"
+        "process.stdout.write(JSON.stringify({ type: 'error',"
+        " error: { type: 'unknown', message: 'Model not found' } }) + '\\n');\n"
+        "process.exit(1);\n"
+    )
+    fake_opencode.chmod(0o755)
+    result = run_bridge()
+    assert result.returncode == 1
+    assert "Model not found" in result.stderr
+    assert "warning: benign" not in result.stderr
+
+    # 1.x NamedError shape: {name, data:{message}}, stderr empty.
+    fake_opencode.write_text(
+        "#!/usr/bin/env node\n"
+        f"process.stdout.write({json.dumps(padding)} + '\\n');\n"
+        "process.stdout.write(JSON.stringify({ type: 'error',"
+        " error: { name: 'ProviderAuthError',"
+        " data: { message: 'Invalid API key' } } }) + '\\n');\n"
+        "process.exit(1);\n"
+    )
+    result = run_bridge()
+    assert result.returncode == 1
+    assert "Invalid API key" in result.stderr
+
+    # No error event: the stdout fallback carries diagnostics, never model text
+    # (a complete text event, or one cut off mid-line by the exit).
+    fake_opencode.write_text(
+        "#!/usr/bin/env node\n"
+        "process.stdout.write(JSON.stringify({ type: 'text',"
+        " part: { type: 'text', text: 'SECRET-MODEL-TEXT' } }) + '\\n');\n"
+        "process.stdout.write('plain diagnostic line\\n');\n"
+        "process.stdout.write('{\"type\":\"text\",\"part\":{\"text\":\"SECRET-CUT');\n"
+        "process.exit(1);\n"
+    )
+    result = run_bridge()
+    assert result.returncode == 1
+    assert "plain diagnostic line" in result.stderr
+    assert "SECRET" not in result.stderr
+
+    # A bracketed log prefix is a diagnostic, not cut-off JSON, and a long
+    # non-text event ahead of it must not push it past the length limit.
+    fake_opencode.write_text(
+        "#!/usr/bin/env node\n"
+        f"process.stdout.write({json.dumps(padding)} + '\\n');\n"
+        "process.stdout.write('[ERROR] Provider unavailable\\n');\n"
+        "process.stdout.write('[{\"type\":\"text\",\"part\":{\"text\":\"SECRET-CUT');\n"
+        "process.exit(1);\n"
+    )
+    result = run_bridge()
+    assert result.returncode == 1
+    assert "[ERROR] Provider unavailable" in result.stderr
+    assert "SECRET" not in result.stderr
 
 
 def test_node_installer_accepts_opencode_only_extraction_provider(tmp_path: Path) -> None:
