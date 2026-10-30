@@ -32,6 +32,8 @@ class FakeReflexioAdapter:
         top_k: int,
         session_id: str | None = None,
         request_id: str | None = None,
+        threshold: float | None = None,
+        reset_session_seen: bool = False,
     ) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
         from claude_smart import runtime
 
@@ -255,7 +257,7 @@ def run_host_learning_happy_path(
             {
                 "project_id": project.name,
                 "query": prompt,
-                "top_k": 5,
+                "top_k": 2,  # default cap: 6 results over 3 collections
                 "session_id": session_id,
                 "host": host,
                 "request_id": fake_reflexio.publish_calls[0]["request_id"],

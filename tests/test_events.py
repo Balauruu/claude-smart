@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import re
@@ -1058,8 +1059,8 @@ def test_user_prompt_injects_context_when_hits_present(
     # Prompt text is passed verbatim as the search query.
     assert calls[0]["project_id"] == "demo"
     assert calls[0]["query"] == "edit pyproject.toml"
-    # Five hits per collection: index lines are bounded, so 15 fit the budget.
-    assert calls[0]["top_k"] == 5
+    # The default cap of 6 results across three collections: 2 per collection.
+    assert calls[0]["top_k"] == 2
     # Session id scopes server-side injection dedup.
     assert calls[0]["session_id"] == "s1"
     # The prompt is still buffered for downstream extraction.
@@ -1128,6 +1129,8 @@ def test_hook_index_stays_within_host_budget_with_fifteen_items(
     from claude_smart.events import pre_tool
 
     monkeypatch.setenv("CLAUDE_SMART_HOST", host)
+    # The character budget is under test, not the per-hook item cap.
+    monkeypatch.setenv("CLAUDE_SMART_MAX_INJECTED_ITEMS", "0")
     hits = _fifteen_hits()
     _stub_user_prompt_adapter(monkeypatch, **hits)
     _stub_pretool_adapter(monkeypatch, **hits)
@@ -1724,7 +1727,7 @@ def test_pre_tool_injects_context_when_hits_present(session_dir, monkeypatch) ->
     # Composed query must reach the adapter scoped to the project.
     assert calls[0]["project_id"] == "demo"
     assert "pyproject.toml" in calls[0]["query"]
-    assert calls[0]["top_k"] == 5
+    assert calls[0]["top_k"] == 2
     # Session id scopes server-side injection dedup.
     assert calls[0]["session_id"] == "s1"
 
@@ -2082,3 +2085,184 @@ def test_stop_bounds_its_synchronous_drain_inside_the_hook_limit(
     # A drain that starts a batch at the latest admissible moment still records
     # its outcome before the host kills the hook.
     assert stop._STOP_PUBLISH_BUDGET_SECONDS < host_limit
+
+
+# -----------------------------------------------------------------------------
+# compaction reset, per-hook item cap, threshold
+# -----------------------------------------------------------------------------
+
+
+class _SearchRecorder:
+    """Adapter double whose searches record kwargs and can simulate an outage."""
+
+    def __init__(self, hits=None, *, fail: bool = False):
+        self.calls: list[dict[str, Any]] = []
+        self.read_errors: list[str] = []
+        self._hits = hits or {}
+        self._fail = fail
+
+    def search_all(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._fail:
+            self.read_errors.append("unified search: down")
+            return [], [], []
+        return (
+            list(self._hits.get("playbooks", [])),
+            list(self._hits.get("agent_playbooks", [])),
+            list(self._hits.get("profiles", [])),
+        )
+
+
+def _emit(adapter, *, session_id: str = "s1") -> str:
+    from claude_smart import context_inject
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        context_inject.emit_context(
+            session_id=session_id,
+            project_id="proj",
+            query="uv sync",
+            hook_event_name="PreToolUse",
+            top_k=5,
+            adapter=adapter,
+        )
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("source", ["startup", "resume", "clear"])
+def test_session_start_requests_reset_only_after_compaction(
+    session_dir, monkeypatch, source: str
+) -> None:
+    monkeypatch.setattr(
+        "claude_smart.events.session_start.Adapter", lambda *a, **kw: object()
+    )
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+
+    session_start.handle({"session_id": "s1", "source": source})
+    assert state.take_search_reset("s1") is False
+
+    session_start.handle({"session_id": "s1", "source": "compact"})
+    assert state.take_search_reset("s1") is True
+
+
+def test_first_search_after_compaction_resets_seen_once(session_dir) -> None:
+    state.request_search_reset("s1")
+    adapter = _SearchRecorder()
+
+    _emit(adapter)
+    _emit(adapter)
+
+    assert [call["reset_session_seen"] for call in adapter.calls] == [True, False]
+
+
+def test_failed_search_keeps_the_compaction_reset(session_dir) -> None:
+    state.request_search_reset("s1")
+
+    _emit(_SearchRecorder(fail=True))
+    healthy = _SearchRecorder()
+    _emit(healthy)
+    _emit(healthy)
+
+    assert [call["reset_session_seen"] for call in healthy.calls] == [True, False]
+
+
+def test_compaction_reset_is_per_session(session_dir) -> None:
+    state.request_search_reset("other")
+    adapter = _SearchRecorder()
+
+    _emit(adapter, session_id="s1")
+
+    assert adapter.calls[0]["reset_session_seen"] is False
+    assert state.take_search_reset("other") is True
+
+
+class _ServerLikeSearch(_SearchRecorder):
+    """Returns at most ``top_k`` hits per collection, as the server does."""
+
+    def __init__(self, per_type: int = 5):
+        hits = {
+            "playbooks": [
+                {"user_playbook_id": f"u{i}", "content": f"user skill {i}"}
+                for i in range(1, per_type + 1)
+            ],
+            "agent_playbooks": [
+                {"agent_playbook_id": f"a{i}", "content": f"shared skill {i}"}
+                for i in range(1, per_type + 1)
+            ],
+            "profiles": [
+                {"profile_id": f"p{i}", "content": f"preference {i}"}
+                for i in range(1, per_type + 1)
+            ],
+        }
+        super().__init__(hits)
+        self.returned: list[str] = []
+
+    def search_all(self, **kwargs):
+        self.calls.append(kwargs)
+        top_k = kwargs["top_k"]
+        result = tuple(
+            list(self._hits[key][:top_k])
+            for key in ("playbooks", "agent_playbooks", "profiles")
+        )
+        self.returned = [
+            str(
+                item.get("user_playbook_id")
+                or item.get("agent_playbook_id")
+                or item.get("profile_id")
+            )
+            for group in result
+            for item in group
+        ]
+        return result
+
+
+@pytest.mark.parametrize(
+    ("raw", "top_k", "total"),
+    [
+        (None, 2, 6),
+        ("", 2, 6),
+        ("bogus", 2, 6),
+        ("-3", 2, 6),
+        ("9", 3, 9),
+        ("7", 2, 6),
+        ("2", 1, 3),
+        ("0", 5, 15),
+    ],
+)
+def test_item_cap_asks_the_server_for_fewer_results(
+    session_dir, monkeypatch, raw: str | None, top_k: int, total: int
+) -> None:
+    """Everything the server returns (and marks served) is injected."""
+    if raw is None:
+        monkeypatch.delenv("CLAUDE_SMART_MAX_INJECTED_ITEMS", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_SMART_MAX_INJECTED_ITEMS", raw)
+    adapter = _ServerLikeSearch()
+
+    out = _emit(adapter)
+
+    assert adapter.calls[0]["top_k"] == top_k
+    assert len(adapter.returned) == total
+    context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    shown = _INDEX_ID_RE.findall(context)
+    assert len(shown) == total
+    injected = {entry["real_id"] for entry in state.read_injected("s1").values()}
+    assert injected == set(adapter.returned)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, None), ("", None), ("0.35", 0.35), ("1", 1.0), ("1.5", None), ("x", None)],
+)
+def test_search_threshold_is_sent_only_when_configured(
+    session_dir, monkeypatch, raw: str | None, expected: float | None
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("CLAUDE_SMART_SEARCH_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_SMART_SEARCH_THRESHOLD", raw)
+    adapter = _SearchRecorder()
+
+    _emit(adapter)
+
+    assert adapter.calls[0]["threshold"] == expected
