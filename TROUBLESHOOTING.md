@@ -10,7 +10,23 @@ The default local setup starts `reflexio embeddings serve` on `127.0.0.1:8072` w
 Check `~/.claude-smart/sessions/`. If your current session's JSONL has no `User`/`Assistant` rows, the plugin isn't receiving hook events — verify `.claude/settings.local.json` has the right path and that `enabledPlugins` is `true`.
 
 **Hooks appear to time out.**
-Each hook is capped at 10–60s (see `plugin/hooks/hooks.json`). If you see long pauses, check `uv` is on PATH — hooks shell out to `uv run`.
+Check the host-specific limits in `plugin/hooks/hooks.json` or
+`plugin/hooks/codex-hooks.json`. Codex dispatch runs the installer's prepared
+Python directly, with a 12-second subprocess budget for prompt/tool events and
+24 seconds for Stop. Missing environments produce a degraded warning and attempt
+installer recovery; check installation status or rerun `npx claude-smart install --host codex`.
+Dependency installation does not run inside a prompt or Stop hook.
+
+`~/.claude-smart/hook-launch.log` records Codex Python launch outcomes and
+`duration_ms`/`budget_ms`, including timeouts before Python can log completion.
+`hook.log` records handler and background publication durations. A contended
+diagnostic log lock skips that optional record rather than holding up the hook.
+These timings omit prompts, tool output and credentials.
+
+Codex Stop saves the turn and queues publication for one detached worker. A
+`queued` result means saved locally, not accepted by Reflexio. Failed work stays
+pending and is retried on a later Stop or SessionStart; HTTP 402 and backend
+rejections still require fixing the underlying billing or server issue.
 
 **Dashboard says npm or Node is missing.**
 The Setup hook should install a private Node.js/npm runtime under `~/.claude-smart/node/current` when no suitable global Node.js is available. If private Node setup or dashboard build fails, claude-smart writes the non-fatal marker `~/.claude-smart/dashboard-unavailable`; `/claude-smart:dashboard` prints that file before log tails. Rerun `npx claude-smart install` to retry dependency setup, or install Node.js 20.9+ manually and run `/claude-smart:restart`. Plugin reload alone does not retry dependency setup.
@@ -60,8 +76,11 @@ rm -rf ~/.reflexio/data/           # reflexio SQLite store
 
 `~/.claude-smart/hook.log` includes `publish-result` records with the plugin version,
 backend scheme/hostname/port, publish count, exception class, and HTTP status when
-available. Missing or malformed version metadata uses `unknown`; unavailable
-URL metadata uses null fields. These records omit credentials, URL paths/query parameters, response
+available. Failed records also carry the `request_id`, the server's `error_reason` (such as
+`request_id_conflict`) and its `server_message`,
+reduced to one line of at most 200 characters with echoed values and credential-shaped
+tokens redacted. Missing or malformed version metadata uses `unknown`; unavailable
+URL metadata uses null fields. These records omit credentials, URL paths/query parameters, full response
 bodies, and interaction content. A logging failure never changes publication success.
 Compare the recorded destination with `~/.claude-smart/.env` when a manual command
 works but automatic publishing fails; an older host plugin may still read the legacy
@@ -89,11 +108,12 @@ adding another note to publish any remaining buffered interactions or an existin
 pending note. If none remain, a new real interaction or note can request extraction.
 A fresh acknowledgement reports the extraction request was accepted. Preflight read failures
 allow the original write to proceed; rejected or lost acknowledgements still
-require verified storage before advancing. Failed verification, mismatched data,
-or nonempty fields absent from the read API (citations and image encoding) leave
-the batch retryable. Recovery requires a backend/read
-contract that exposes the submitted fields; read APIs that omit nonempty learning
-links cannot confirm their storage. Known tool status and learning-link fields
+require verified storage before advancing. Failed verification or mismatched data
+leave the batch retryable. Citations and image encoding are absent from the read
+API: when every field it does return matches, the request is recovered and the
+`publish-result` record lists them under `unverified_fields`. Unknown fields still
+refuse recovery, and read APIs that omit nonempty learning links cannot confirm
+their storage. Known tool status and learning-link fields
 are verified from the raw response when the installed SDK predates them. Legacy
 responses that omit status retain their original compatibility behavior. Stable
 raw retries keep the original payload and learning links unchanged; an unconfirmed failure waits for the next
@@ -103,6 +123,33 @@ attribution, including earlier chunks. Null escaping also covers nested mapping
 keys and tuple values; a key collision fails before sending instead of losing data.
 Empty placeholders are filtered before splitting; an empty-only batch advances
 the local watermark without sending a request. Original local records are retained.
+
+Reflexio servers that replay a reused `request_id` answer an identical retry with
+`success: true` and `replayed: true`; the plugin records that as `recovered`. A retry
+whose content differs gets HTTP 409 with reason `request_id_conflict`. When the
+stored-request read also shows the stored request is not this batch, the batch is
+parked at once, since no retry under that ID can succeed. Older servers answer a reused
+ID with HTTP 200 `success: false` "already exists" and go through the verified recovery
+above.
+
+A frozen batch the server rejects with the same HTTP 200 `success: false` reason, or with
+a 409 conflict the read could not confirm, five times over at least an hour, is parked
+so later turns can publish. The session buffer
+records a `publish_dead_letter` entry with the request ID, record range and reason, and
+the watermark moves past that range; its local records stay in the buffer. Transport
+errors, HTTP 402 billing stops, other 4xx responses and 5xx outages never count toward
+parking. hook.log
+records each park as `publish-parked`.
+
+Claude Code and OpenCode Stop handlers drain synchronously within a 20-second budget
+(Claude Code cancels the Stop hook at its 30-second `timeout`; OpenCode applies no limit,
+so the budget only bounds how long an idle session waits). Claude Code's SessionEnd drain
+uses 45 seconds, inside the 60-second ceiling Claude Code places on SessionEnd hooks.
+Codex Stop only queues the turn; its detached worker is not killed by the host and
+publishes one batch per pass with the same recovery and parking rules. It sends each request, including each chunk of a large batch,
+only while enough time remains for the request, its stored-request verification and the
+local watermark write; otherwise it logs `publish-deferred` and the next drain continues
+from the same frozen batch. A manual `learn` that parks a batch says so and exits nonzero.
 
 **Dashboard loads without layout or styling.**
 

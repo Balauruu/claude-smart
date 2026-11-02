@@ -60,7 +60,9 @@ def test_codex_hook_loads_managed_reflexio_env_and_skips_backend_start() -> None
     assert "function parsePositiveInteger(value, fallback)" in script
     assert "const SERVICE_SCRIPT_TIMEOUT_MS = parsePositiveInteger" in script
     assert "timeout: SERVICE_SCRIPT_TIMEOUT_MS" in script
-    assert 'runServiceScript(root, "backend-service.sh", "start", "backend.log")' in script
+    assert (
+        'runServiceScript(root, "backend-service.sh", "start", "backend.log")' in script
+    )
     assert (
         'runServiceScript(root, "dashboard-service.sh", "start", "dashboard.log")'
         in script
@@ -186,8 +188,13 @@ def test_codex_hooks_use_expected_events_and_marketplace_fallback() -> None:
     backend_service = (
         REPO_ROOT / "plugin" / "scripts" / "backend-service.sh"
     ).read_text()
-    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}
-    assert "PreToolUse" not in hooks
+    assert set(hooks) == {
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+    }
     assert 'CLAUDE_SMART_HOST="codex"' in codex_env
     assert 'CLAUDE_SMART_CLI_PATH="$PLUGIN_ROOT/scripts/codex-claude-compat"' in (
         backend_service
@@ -226,28 +233,71 @@ def test_hook_main_accepts_legacy_and_host_argv(monkeypatch) -> None:
     assert calls == [("claude-code", "stop"), ("codex", "stop")]
 
 
-def test_codex_pre_tool_does_not_inject_context(monkeypatch) -> None:
+def test_codex_pre_tool_is_registered_for_bash_only() -> None:
+    """Codex PreToolUse additionalContext reaches the model; shell is ``Bash``."""
+    blocks = _read_json("plugin/hooks/codex-hooks.json")["hooks"]["PreToolUse"]
+    assert [block["matcher"] for block in blocks] == ["Bash"]
+    (hook_def,) = blocks[0]["hooks"]
+    assert hook_def["command"].endswith('hook_entry.sh" codex pre-tool')
+    # Within the 12-second Python budget codex-hook.js gives pre-tool.
+    assert 12 < hook_def["timeout"] <= 15
+
+
+def test_codex_session_start_runs_handler_after_compaction() -> None:
+    """Codex fires SessionStart with source "compact" before the next request."""
+    blocks = _read_json("plugin/hooks/codex-hooks.json")["hooks"]["SessionStart"]
+    # Existing trust keys index blocks; the compact block is appended.
+    assert blocks[0]["matcher"] == "startup|resume"
+    compact = [block for block in blocks if block["matcher"] == "compact"]
+    assert len(compact) == 1 and blocks[-1] is compact[0]
+    (hook_def,) = compact[0]["hooks"]
+    assert hook_def["command"].endswith('hook_entry.sh" codex session-start')
+    assert hook_def["timeout"] > 24  # codex-hook.js session-start budget
+
+
+def test_codex_pre_tool_injects_context(monkeypatch) -> None:
     runtime.set_host(runtime.HOST_CODEX)
-    called = False
+    calls: list[dict[str, Any]] = []
 
-    def fail_emit(**_kwargs):
-        nonlocal called
-        called = True
+    def fake_emit(**kwargs):
+        calls.append(kwargs)
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": "ctx",
+                    }
+                }
+            )
+            + "\n"
+        )
+        return True
 
-    monkeypatch.setattr(pre_tool.context_inject, "emit_context", fail_emit)
+    monkeypatch.setattr(pre_tool.context_inject, "emit_context", fake_emit)
+    monkeypatch.setattr(pre_tool.ids, "resolve_user_id", lambda _cwd: "proj")
     buf = io.StringIO()
     monkeypatch.setattr(sys, "stdout", buf)
 
     pre_tool.handle(
         {
             "session_id": "s1",
+            "turn_id": "t1",
+            "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
+            "tool_use_id": "call-1",
             "tool_input": {"command": "uv run pytest"},
+            "cwd": "/repo",
         }
     )
 
-    assert called is False
-    assert json.loads(buf.getvalue()) == {"continue": True}
+    assert [call["query"] for call in calls] == ["uv run pytest"]
+    assert calls[0]["hook_event_name"] == "PreToolUse"
+    assert calls[0]["session_id"] == "s1"
+    output = json.loads(buf.getvalue())
+    assert output["hookSpecificOutput"]["additionalContext"] == "ctx"
+    # Codex fails a PreToolUse run that returns suppressOutput.
+    assert "suppressOutput" not in output
 
 
 def test_codex_citation_instruction_uses_text_marker_not_tool_call() -> None:
@@ -264,7 +314,11 @@ def test_codex_stop_prefers_last_assistant_message(session_dir, monkeypatch) -> 
     runtime.set_host(runtime.HOST_CODEX)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        stop.publish, "publish_unpublished", lambda **kw: calls.append(kw)
+        stop.publish_outbox,
+        "enqueue",
+        lambda session_id, project_id: (
+            calls.append(dict(session_id=session_id, project_id=project_id)) or True
+        ),
     )
     monkeypatch.setattr(stop.ids, "resolve_user_id", lambda *_a, **_kw: "demo")
 
@@ -316,7 +370,11 @@ def test_codex_stop_skips_internal_prompt_from_transcript(
         + "\n"
     )
     monkeypatch.setattr(
-        stop.publish, "publish_unpublished", lambda **kw: calls.append(kw)
+        stop.publish_outbox,
+        "enqueue",
+        lambda session_id, project_id: (
+            calls.append(dict(session_id=session_id, project_id=project_id)) or True
+        ),
     )
 
     stop.handle({"session_id": "s1", "transcript_path": str(transcript)})
@@ -329,7 +387,11 @@ def test_codex_stop_skips_orphan_title_response(session_dir, monkeypatch) -> Non
     runtime.set_host(runtime.HOST_CODEX)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        stop.publish, "publish_unpublished", lambda **kw: calls.append(kw)
+        stop.publish_outbox,
+        "enqueue",
+        lambda session_id, project_id: (
+            calls.append(dict(session_id=session_id, project_id=project_id)) or True
+        ),
     )
 
     stop.handle(
@@ -349,7 +411,11 @@ def test_codex_stop_skips_orphan_suggestions_response(session_dir, monkeypatch) 
     runtime.set_host(runtime.HOST_CODEX)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        stop.publish, "publish_unpublished", lambda **kw: calls.append(kw)
+        stop.publish_outbox,
+        "enqueue",
+        lambda session_id, project_id: (
+            calls.append(dict(session_id=session_id, project_id=project_id)) or True
+        ),
     )
 
     stop.handle(
@@ -373,7 +439,11 @@ def test_codex_stop_keeps_user_requested_title_json(session_dir, monkeypatch) ->
     runtime.set_host(runtime.HOST_CODEX)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        stop.publish, "publish_unpublished", lambda **kw: calls.append(kw)
+        stop.publish_outbox,
+        "enqueue",
+        lambda session_id, project_id: (
+            calls.append(dict(session_id=session_id, project_id=project_id)) or True
+        ),
     )
     state.append(
         "s1",
@@ -405,7 +475,11 @@ def test_codex_stop_keeps_user_requested_suggestions_json(
     runtime.set_host(runtime.HOST_CODEX)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        stop.publish, "publish_unpublished", lambda **kw: calls.append(kw)
+        stop.publish_outbox,
+        "enqueue",
+        lambda session_id, project_id: (
+            calls.append(dict(session_id=session_id, project_id=project_id)) or True
+        ),
     )
     state.append(
         "s1",
@@ -535,7 +609,7 @@ def test_codex_install_succeeds_when_hooks_and_marketplace_succeed(
     assert rc == 0
     env_text = env_path.read_text()
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in env_text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in env_text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in env_text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in env_text
     config = config_path.read_text()
     assert "plugin_hooks = true" in config
@@ -703,9 +777,13 @@ def test_codex_uninstall_cleans_plugin_config_cache_and_marketplace(
     # both inside tmp_path, never the real home.
     monkeypatch.setattr(cli, "_REFLEXIO_DIR", tmp_path / ".reflexio")
     monkeypatch.setattr(cli, "_STATE_DIR", tmp_path / ".claude-smart")
-    monkeypatch.setattr(cli, "_CLAUDE_SMART_ENV_PATH", tmp_path / ".claude-smart" / ".env")
     monkeypatch.setattr(
-        cli, "_OPENCODE_LOCAL_PACKAGE_DIR", tmp_path / ".claude-smart" / "opencode" / "claude-smart"
+        cli, "_CLAUDE_SMART_ENV_PATH", tmp_path / ".claude-smart" / ".env"
+    )
+    monkeypatch.setattr(
+        cli,
+        "_OPENCODE_LOCAL_PACKAGE_DIR",
+        tmp_path / ".claude-smart" / "opencode" / "claude-smart",
     )
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/bin/{name}")
     monkeypatch.setattr(

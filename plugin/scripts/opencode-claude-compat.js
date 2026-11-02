@@ -116,15 +116,18 @@ function runOpenCode({ prompt, model, workDir }) {
     throw new Error("opencode CLI not found on PATH");
   }
 
+  // No `--pure` / `--dir`: V2's `opencode run` rejects both. OPENCODE_PURE=1
+  // is 1.x's --pure in env form (skip external plugins); V2 has no pure mode
+  // and ignores it, so on V2 the extraction run loads the user's global
+  // plugins. Project isolation comes from
+  // `cwd: workDir` below, which carries the temp `.opencode/opencode.json`
+  // that defines AGENT_NAME.
   const args = [
     "run",
-    "--pure",
     "--format",
     "json",
     "--agent",
     AGENT_NAME,
-    "--dir",
-    workDir,
   ];
   const selectedModel = opencodeModel(model);
   if (selectedModel) {
@@ -141,6 +144,11 @@ function runOpenCode({ prompt, model, workDir }) {
     encoding: "utf8",
     env: {
       ...process.env,
+      OPENCODE_PURE: "1",
+      // opencode resolves the project root from $PWD, not the spawn cwd.
+      // A stale inherited PWD points at the caller's directory, so the temp
+      // `.opencode/opencode.json` defining AGENT_NAME is never read.
+      PWD: workDir,
       CLAUDE_SMART_HOST: "opencode",
       CLAUDE_SMART_INTERNAL: "1",
       CLAUDE_CODE_ENTRYPOINT: "optimizer",
@@ -156,8 +164,15 @@ function runOpenCode({ prompt, model, workDir }) {
     throw proc.error;
   }
   if (proc.status !== 0) {
-    const stderr = String(proc.stderr || "").trim().slice(0, 500);
-    throw new Error(`opencode CLI exited ${proc.status}: ${stderr}`);
+    // opencode reports CLI errors as JSON events on stdout and can emit
+    // step_start events before the error, so a fixed-size slice of stdout — or
+    // a nonempty warning-only stderr — can hide it. Read the error event first.
+    const eventMessage = errorEventMessage(proc.stdout);
+    const stderr = String(proc.stderr || "").trim().slice(0, 300);
+    const stdout = stdoutDiagnostic(proc.stdout);
+    throw new Error(
+      `opencode CLI exited ${proc.status}: ${eventMessage || stderr || stdout}`,
+    );
   }
   const content = parseOpenCodeJson(proc.stdout);
   if (!content) {
@@ -194,6 +209,60 @@ function parseOpenCodeJson(stdout) {
     }
   }
   return stripOuterMarkdownFence(chunks.join("").trim());
+}
+
+// Extract the message from any `error` events in an `opencode run --format json`
+// stdout stream. Handles the 2.x shape ({type:"error", error:{message}}) and the
+// 1.x NamedError shape ({type:"error", error:{name, data:{message}}}).
+function errorEventMessage(stdout) {
+  const messages = [];
+  for (const line of String(stdout || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!event || event.type !== "error") continue;
+    const err = event.error;
+    const message =
+      (err && typeof err.message === "string" && err.message) ||
+      (err && err.data && typeof err.data.message === "string" && err.data.message) ||
+      (err && typeof err.name === "string" && err.name) ||
+      "";
+    if (message) messages.push(message);
+  }
+  return messages.join("; ").slice(0, 300);
+}
+
+// The stdout fallback is diagnostics only: drop text events (model output)
+// and lines that start like a JSON event but do not parse (a text event cut
+// off by the exit). Plain lines, including "[ERROR] ..." prefixes, go ahead of
+// other events so a long step_start cannot push them past the length limit.
+function stdoutDiagnostic(stdout) {
+  const plain = [];
+  const events = [];
+  for (const line of String(stdout || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      if (!/^(\{"|\[[{["])/.test(trimmed)) plain.push(trimmed);
+      continue;
+    }
+    if (!event || typeof event !== "object") {
+      plain.push(trimmed);
+      continue;
+    }
+    const part = event.part;
+    if (event.type === "text" || (part && part.type === "text")) continue;
+    events.push(trimmed);
+  }
+  return [...plain, ...events].join("\n").slice(0, 300);
 }
 
 function stripOuterMarkdownFence(content) {

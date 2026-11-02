@@ -17,27 +17,12 @@ class FakeReflexioAdapter:
     def __init__(self, host_label: str) -> None:
         self.host_label = host_label
         self.url = "http://localhost:8071/"
+        self.api_key = ""
         self.search_calls: list[dict[str, Any]] = []
         self.publish_calls: list[dict[str, Any]] = []
-        self.extraction_defaults: list[dict[str, int]] = []
-        self.optimizer_defaults: list[dict[str, Any]] = []
 
     def fetch_stall_state(self) -> None:
         return None
-
-    def apply_extraction_defaults(self, *, window_size: int, stride_size: int) -> bool:
-        self.extraction_defaults.append(
-            {"window_size": window_size, "stride_size": stride_size}
-        )
-        return True
-
-    def apply_optimizer_defaults(
-        self, *, script_path: str, timeout_seconds: int = 300
-    ) -> bool:
-        self.optimizer_defaults.append(
-            {"script_path": script_path, "timeout_seconds": timeout_seconds}
-        )
-        return True
 
     def search_all(
         self,
@@ -47,6 +32,8 @@ class FakeReflexioAdapter:
         top_k: int,
         session_id: str | None = None,
         request_id: str | None = None,
+        threshold: float | None = None,
+        reset_session_seen: bool = False,
     ) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
         from claude_smart import runtime
 
@@ -92,6 +79,7 @@ class FakeReflexioAdapter:
         force_extraction: bool = False,
         override_learning_stall: bool = False,
         skip_aggregation: bool = False,
+        deadline: float | None = None,
     ) -> PublishResult:
         from claude_smart import runtime
         from claude_smart.reflexio_adapter import PublishResult
@@ -165,7 +153,15 @@ def run_host_learning_happy_path(
     expected_state_dir: Path | None = None,
 ) -> dict[str, Any]:
     import claude_smart
-    from claude_smart import context_inject, cs_cite, publish, runtime, state
+    from claude_smart import (
+        context_format,
+        context_inject,
+        cs_cite,
+        publish,
+        publish_outbox,
+        runtime,
+        state,
+    )
     from claude_smart.events import session_start
 
     loaded_from = Path(claude_smart.__file__).resolve()
@@ -181,10 +177,14 @@ def run_host_learning_happy_path(
     fake_reflexio = FakeReflexioAdapter(host_label=host)
     original_context_adapter = context_inject.Adapter
     original_publish_adapter = publish.Adapter
+    original_outbox_adapter = publish_outbox.Adapter
+    original_outbox_spawn = publish_outbox._spawn_worker
     original_session_start_adapter = session_start._adapter
     previous_host = runtime.host()
     context_inject.Adapter = lambda: fake_reflexio
     publish.Adapter = lambda: fake_reflexio
+    publish_outbox.Adapter = lambda: fake_reflexio
+    publish_outbox._spawn_worker = lambda _token: None
     session_start._adapter = lambda: fake_reflexio
     try:
         project = work_root / f"{host}-learning-e2e-project"
@@ -212,7 +212,11 @@ def run_host_learning_happy_path(
         additional_context = user_prompt_output["hookSpecificOutput"][
             "additionalContext"
         ]
-        assert f"{host} project skill" in additional_context
+        # Index lines show when an item applies (its trigger), not its content;
+        # items without a trigger fall back to their content's first line.
+        assert "] matching prompt" in additional_context
+        assert f"{host} project skill" not in additional_context
+        assert context_format.LOADER_COMMAND in additional_context
         assert f"{host} shared skill" in additional_context
         assert f"{host} preference" in additional_context
         assert cs_cite.MARKER_PREFIX in additional_context
@@ -241,15 +245,19 @@ def run_host_learning_happy_path(
 
         stop_output = _run_hook(host, "stop", stop_payload)
         assert stop_output["continue"] is True
+        if host == runtime.HOST_CODEX:
+            # Exercise the durable enqueue/drain boundary deterministically;
+            # the separate launcher test covers actual detached process startup.
+            assert fake_reflexio.publish_calls == []
+            claim = publish_outbox._root() / "launch.claim"
+            token = json.loads(claim.read_text())["token"]
+            publish_outbox.run_worker(token)
 
-        assert fake_reflexio.extraction_defaults == [
-            {"window_size": 5, "stride_size": 3}
-        ]
         assert fake_reflexio.search_calls == [
             {
                 "project_id": project.name,
                 "query": prompt,
-                "top_k": 3,
+                "top_k": 2,  # default cap: 6 results over 3 collections
                 "session_id": session_id,
                 "host": host,
                 "request_id": fake_reflexio.publish_calls[0]["request_id"],
@@ -312,5 +320,7 @@ def run_host_learning_happy_path(
     finally:
         context_inject.Adapter = original_context_adapter
         publish.Adapter = original_publish_adapter
+        publish_outbox.Adapter = original_outbox_adapter
+        publish_outbox._spawn_worker = original_outbox_spawn
         session_start._adapter = original_session_start_adapter
         runtime.set_host(previous_host)

@@ -7,12 +7,15 @@ Exists so hook handlers (a) don't import reflexio directly at module scope
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import os
+import re
+import time
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from claude_smart import env_config, runtime
@@ -27,9 +30,29 @@ _ENV_API_KEY = "REFLEXIO_API_KEY"
 # unhealthy POST would freeze the user's prompt. 5s matches the precedent
 # in ``ids.py`` for short-lived hook HTTP calls.
 _HTTP_TIMEOUT_SECONDS = 5
+# Worst case for one stable publish attempt: the POST plus one stored-request
+# verification read. Hook drains reserve this before sending a batch.
+PUBLISH_ATTEMPT_SECONDS = 2 * _HTTP_TIMEOUT_SECONDS
+# A deadline-bound publish sends a request only when the attempt and the local
+# outcome write still fit before the host kills the hook. Sending without that
+# margin is how a stored request lost its watermark.
+PUBLISH_RESERVE_SECONDS = PUBLISH_ATTEMPT_SECONDS + 2
+# GetRequests does not return these fields, so a replay cannot compare them.
+_UNVERIFIABLE_FIELDS = ("citations", "image_encoding")
+# Wire keys of one ``retrieved_learnings`` entry. ``loaded`` is optional;
+# servers that predate it accept and discard it (``CapturesUnknownFields``).
+_RETRIEVED_REF_KEYS = frozenset(
+    {"kind", "learning_id", "exposure_receipt", "exposure_receipt_digest", "loaded"}
+)
+_SERVER_MESSAGE_LIMIT = 200
+# Reflexio >= #807 answers a reused request_id naming different content with
+# HTTP 409 and this reason; an identical retry succeeds with ``replayed``.
+_REQUEST_ID_CONFLICT = "request_id_conflict"
 _SEARCH_MODE_HYBRID = "hybrid"  # reflexio.models.config_schema.SearchMode.HYBRID
 _SOURCE = "claude-smart"
 _UNIFIED_ENTITY_TYPES = ("profiles", "user_playbooks", "agent_playbooks")
+# ``search_all`` returns up to ``top_k`` results for each of these.
+SEARCHED_ENTITY_TYPE_COUNT = len(_UNIFIED_ENTITY_TYPES)
 _AGENT_PLAYBOOK_APPROVAL_STATUSES = ("pending", "approved")
 _REJECTED_AGENT_PLAYBOOK_STATUS = "rejected"
 _LOCAL_8071_URLS = {
@@ -63,9 +86,23 @@ class PublishResult:
     request_ids: tuple[str, ...] | None = None
     recovered: bool = False
     no_op: bool = False
+    server_message: str | None = None
+    error_reason: str | None = None
+    unverified_fields: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return self.ok
+
+
+class _StoredPublishMismatch(ValueError):
+    """The stored request under this ID is decidably not this payload."""
+
+
+@dataclass(frozen=True)
+class _StoredPublish:
+    """A stored request matched on every field the read API exposes."""
+
+    unverified_fields: tuple[str, ...] = ()
 
 
 @dataclass
@@ -158,14 +195,22 @@ class Adapter:
         force_extraction: bool = False,
         override_learning_stall: bool = False,
         skip_aggregation: bool = False,
+        deadline: float | None = None,
     ) -> PublishResult:
-        """Publish interactions and return this call's confirmed request ID."""
+        """Publish interactions and return this call's confirmed request ID.
+
+        With a ``time.monotonic()`` ``deadline``, no stable request is sent
+        unless ``PUBLISH_RESERVE_SECONDS`` remain; the batch then fails as
+        ``DeadlineReached`` and keeps its frozen request identities.
+        """
         if not interactions:
             return PublishResult(True)
         client = self._get_client()
         if client is None:
             result = PublishResult(False, error_type="ClientUnavailable")
-            self._log_publish(result, session_id, project_id, len(interactions))
+            self._log_publish(
+                result, session_id, project_id, len(interactions), request_id
+            )
             return result
         result, _response = self._attempt_publish(
             client,
@@ -176,14 +221,24 @@ class Adapter:
             force_extraction=force_extraction,
             override_learning_stall=override_learning_stall,
             skip_aggregation=skip_aggregation,
+            deadline=deadline,
         )
         self._log_publish(
-            result, session_id, project_id, 0 if result.no_op else len(interactions)
+            result,
+            session_id,
+            project_id,
+            0 if result.no_op else len(interactions),
+            request_id,
         )
         return result
 
     def _log_publish(
-        self, result: PublishResult, session_id: str, project_id: str, count: int
+        self,
+        result: PublishResult,
+        session_id: str,
+        project_id: str,
+        count: int,
+        request_id: str | None = None,
     ) -> None:
         """Record useful transport diagnostics without credentials or payloads."""
         try:
@@ -204,6 +259,19 @@ class Adapter:
                 port = url.port if url is not None else None
             except ValueError:
                 port = None
+            extra: dict[str, Any] = {
+                "backend_scheme": scheme,
+                "backend_host": hostname,
+                "backend_port": port,
+                "error_type": result.error_type,
+                "http_status": result.http_status,
+            }
+            if not result.ok:
+                extra["request_id"] = result.request_id or request_id
+                extra["server_message"] = result.server_message
+                extra["error_reason"] = result.error_reason
+            if result.unverified_fields:
+                extra["unverified_fields"] = list(result.unverified_fields)
             hook_log.log_event(
                 event="publish-result",
                 host=runtime.host(),
@@ -219,13 +287,7 @@ class Adapter:
                 if result.ok
                 else "failed",
                 publish_count=count,
-                extra={
-                    "backend_scheme": scheme,
-                    "backend_host": hostname,
-                    "backend_port": port,
-                    "error_type": result.error_type,
-                    "http_status": result.http_status,
-                },
+                extra=extra,
             )
         except Exception:  # noqa: BLE001 — telemetry must never affect publication.
             return
@@ -241,6 +303,7 @@ class Adapter:
         force_extraction: bool,
         override_learning_stall: bool,
         skip_aggregation: bool,
+        deadline: float | None = None,
     ) -> tuple[PublishResult, Any]:
         """Run the publish and return ``(result, raw response)``.
 
@@ -260,6 +323,7 @@ class Adapter:
             if request_id is not None and callable(raw_request):
                 confirmed_ids: list[str] = []
                 recovered = False
+                unverified: set[str] = set()
                 raw_response: Any = None
                 for index, start in enumerate(range(0, len(interaction_list), 1000)):
                     chunk = interaction_list[start : start + 1000]
@@ -288,11 +352,21 @@ class Adapter:
                         try:
                             stored = _stored_publish_matches(raw_request, payload)
                         except Exception:  # noqa: BLE001 — a read outage must not block fresh writes.
-                            stored = False
+                            stored = None
                         if stored:
                             recovered = True
+                            unverified.update(stored.unverified_fields)
                             confirmed_ids.append(chunk_id)
                             continue
+                    if (
+                        deadline is not None
+                        and deadline - time.monotonic() < PUBLISH_RESERVE_SECONDS
+                    ):
+                        # Accepted earlier chunks are recovered by the next
+                        # drain's preflight read under the same identities.
+                        return PublishResult(
+                            False, chunk_id, error_type="DeadlineReached"
+                        ), raw_response
                     try:
                         raw_response = raw_request(
                             "POST",
@@ -301,25 +375,52 @@ class Adapter:
                             params=None,
                         )
                     except Exception as exc:  # noqa: BLE001
+                        response = getattr(exc, "response", None)
+                        reason, message = _http_error_details(response)
                         try:
                             stored = _stored_publish_matches(raw_request, payload)
+                        except _StoredPublishMismatch:
+                            if reason != _REQUEST_ID_CONFLICT:
+                                raise exc from None
+                            stored = None
                         except Exception:  # noqa: BLE001 — preserve the publish failure.
                             raise exc from None
                         if stored:
                             recovered = True
+                            unverified.update(stored.unverified_fields)
                             confirmed_ids.append(chunk_id)
                             continue
+                        if reason == _REQUEST_ID_CONFLICT:
+                            # The server compared the full payload and the
+                            # read confirms the stored request is not this one.
+                            return PublishResult(
+                                False,
+                                chunk_id,
+                                error_type="RequestIdConflict",
+                                http_status=getattr(response, "status_code", None),
+                                server_message=message,
+                                error_reason=reason,
+                            ), raw_response
                         raise
                     _log_publish_warnings(raw_response)
                     result = _confirmed_publish(raw_response, chunk_id)
+                    recovered = recovered or result.recovered
                     if not result:
+                        conflict = replace(result, error_type="RequestIdConflict")
                         try:
                             stored = _stored_publish_matches(raw_request, payload)
+                        except _StoredPublishMismatch:
+                            if result.error_reason == _REQUEST_ID_CONFLICT:
+                                return conflict, raw_response
+                            return result, raw_response
                         except Exception:  # noqa: BLE001 — preserve rejection diagnostics.
                             return result, raw_response
                         if not stored:
+                            if result.error_reason == _REQUEST_ID_CONFLICT:
+                                return conflict, raw_response
                             return result, raw_response
                         recovered = True
+                        unverified.update(stored.unverified_fields)
                     confirmed_ids.append(chunk_id)
                 return PublishResult(
                     True,
@@ -328,6 +429,7 @@ class Adapter:
                     if len(confirmed_ids) > 1
                     else None,
                     recovered=recovered,
+                    unverified_fields=tuple(sorted(unverified)),
                 ), raw_response
             if _needs_raw_retrieved_learning_publish(interaction_list):
                 _LOGGER.warning(
@@ -354,95 +456,16 @@ class Adapter:
             return _confirmed_publish(response), response
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("publish_interaction failed: %s", exc)
-            status = getattr(getattr(exc, "response", None), "status_code", None)
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            reason, message = _http_error_details(response)
             return PublishResult(
                 False,
                 error_type=type(exc).__name__,
                 http_status=status if isinstance(status, int) else None,
+                server_message=message,
+                error_reason=reason,
             ), None
-
-    def apply_extraction_defaults(self, *, window_size: int, stride_size: int) -> bool:
-        """Push claude-smart's preferred extraction defaults to the reflexio server.
-
-        Reads the current ``Config`` and only issues a ``set_config`` when the
-        server-side values differ, so steady state is a single cheap GET.
-
-        Reflexio persists ``Config`` to disk, so once these values land they
-        survive backend restarts. The flip side: if an operator customizes
-        ``window_size``/``stride_size`` via the dashboard, this call will
-        overwrite those values back to the claude-smart defaults on the next
-        SessionStart. To change the defaults, edit the constants at the call
-        site in ``events/session_start.py``.
-
-        Args:
-            window_size (int): Desired ``Config.window_size`` on the server.
-            stride_size (int): Desired ``Config.stride_size`` on the
-                server. Must be ``<= window_size`` (reflexio enforces this).
-
-        Returns:
-            bool: True if the server is already at the target values or the
-                write succeeded; False if reflexio is unreachable or the call
-                raised.
-        """
-        client = self._get_client()
-        if client is None:
-            return False
-        try:
-            config = client.get_config()
-            if (
-                getattr(config, "window_size", None) == window_size
-                and getattr(config, "stride_size", None) == stride_size
-            ):
-                return True
-            config.window_size = window_size
-            config.stride_size = stride_size
-            client.set_config(config)
-            return True
-        except Exception as exc:  # noqa: BLE001 — adapter must never raise.
-            _LOGGER.warning("apply_extraction_defaults failed: %s", exc)
-            return False
-
-    def apply_optimizer_defaults(
-        self, *, script_path: str, timeout_seconds: int = 300
-    ) -> bool:
-        """Push claude-smart's shared skill optimizer defaults to reflexio.
-
-        Idempotent compare-then-write: reads ``Config``, only issues a
-        ``set_config`` when the server-side values differ from the desired
-        dict below. SessionStart calls this only for local Reflexio URLs by
-        default; ``CLAUDE_SMART_ENABLE_OPTIMIZER=1`` forces hosted URLs, and
-        ``CLAUDE_SMART_ENABLE_OPTIMIZER=0`` disables it everywhere.
-        """
-        client = self._get_client()
-        if client is None:
-            return False
-        try:
-            config = client.get_config()
-            opt = getattr(config, "playbook_optimizer_config", None)
-            if opt is None:
-                return False
-
-            desired = {
-                "enabled": True,
-                "optimize_user_playbooks": False,
-                "optimize_agent_playbooks": True,
-                "auto_update_user_playbooks": True,
-                "min_commit_windows": 1,
-                "max_metric_calls": 15,
-                "assistant_script_path": script_path,
-                "assistant_script_args": [],
-                "webhook_url": None,
-                "webhook_timeout_seconds": timeout_seconds,
-            }
-            if all(getattr(opt, key, None) == value for key, value in desired.items()):
-                return True
-            for key, value in desired.items():
-                setattr(opt, key, value)
-            client.set_config(config)
-            return True
-        except Exception as exc:  # noqa: BLE001 — adapter must never raise.
-            _LOGGER.warning("apply_optimizer_defaults failed: %s", exc)
-            return False
 
     # -----------------------------------------------------------------
     # Stall-state reads/writes (used by SessionStart banner)
@@ -569,6 +592,8 @@ class Adapter:
         top_k: int = 5,
         session_id: str | None = None,
         request_id: str | None = None,
+        threshold: float | None = None,
+        reset_session_seen: bool = False,
     ) -> tuple[list[Any], list[Any], list[Any]]:
         """Unified hybrid search → ``(user_playbooks, agent_playbooks, preferences)``.
 
@@ -588,6 +613,12 @@ class Adapter:
                 within one session stop re-injecting the same rules.
             request_id (str | None): Durable identity reserved for the response
                 that will publish this retrieved context.
+            threshold (float | None): Similarity threshold. Sent only when
+                set; otherwise the server's embedding default applies.
+            reset_session_seen (bool): Ask the server to forget what it
+                already served ``session_id`` before dedup (after the host
+                compacted the conversation). Sent only when True and the
+                installed client accepts it; see ``_client_accepts``.
 
         Returns:
             tuple[list[Any], list[Any], list[Any]]: ``(user_playbooks,
@@ -598,6 +629,16 @@ class Adapter:
         client = self._get_client()
         if client is None:
             return [], [], []
+        optional: dict[str, Any] = {}
+        if threshold is not None:
+            optional["threshold"] = threshold
+        if reset_session_seen and session_id:
+            if _client_accepts(client.search, "reset_session_seen"):
+                optional["reset_session_seen"] = True
+            else:
+                _LOGGER.debug(
+                    "installed reflexio client cannot send reset_session_seen"
+                )
         try:
             response = client.search(
                 query=query,
@@ -610,6 +651,7 @@ class Adapter:
                 search_mode=_SEARCH_MODE_HYBRID,
                 session_id=session_id,
                 request_id=request_id,
+                **optional,
             )
         except Exception as exc:  # noqa: BLE001
             self._record_read_error("unified search", exc)
@@ -661,6 +703,31 @@ class Adapter:
         message = f"{operation}: {exc}"
         self.read_errors.append(message)
         _LOGGER.debug("%s failed: %s", operation, exc)
+
+
+def _client_accepts(method: Any, parameter: str) -> bool:
+    """Return whether a client method takes ``parameter`` as a keyword.
+
+    ``ReflexioClient.search`` validates its keywords into a local request
+    model before sending, so a field the installed SDK predates cannot be
+    passed through it at all. Servers ignore unknown search fields
+    (``UnifiedSearchRequest`` keeps pydantic's default ``extra="ignore"``),
+    so the installed client is the only gate needed.
+
+    Args:
+        method (Any): The bound client method.
+        parameter (str): Keyword name to look for.
+
+    Returns:
+        bool: True when the signature names ``parameter`` or takes ``**kwargs``.
+    """
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return parameter in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
 
 
 def _log_publish_warnings(response: Any) -> None:
@@ -715,11 +782,19 @@ def _canonical_learning_reference(ref: dict[str, Any]) -> dict[str, Any]:
     return canonical
 
 
-def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
-    """Confirm the exact stored request before recovering a lost acknowledgement.
+def _stored_publish_matches(
+    raw_request: Any, payload: dict[str, Any]
+) -> _StoredPublish | None:
+    """Confirm the stored request before recovering a lost acknowledgement.
 
-    GetRequests exposes complete text/tool/link fields, but not citations or
-    image_encoding. Nonempty omitted fields cannot safely confirm a replay.
+    Returns ``None`` when nothing is stored under the request ID, and raises on
+    any identity, count or visible-field mismatch. GetRequests exposes complete
+    text/tool/link fields, but not citations or image_encoding. The request ID
+    names one frozen buffer range, so a stored request whose every visible field
+    matches is that range's earlier delivery; nonempty omitted fields are
+    reported as unverified rather than blocking recovery. Refusing them wedged
+    every later turn behind a request the server had already stored. Unknown
+    fields still refuse: the read API's coverage of them is unknown.
     """
     import json
 
@@ -736,12 +811,16 @@ def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
     if not isinstance(sessions, list):
         raise ValueError("Stored publish confirmation query is incomplete")
     if not sessions:
-        return False
+        return None
     if len(sessions) != 1 or sessions[0].get("session_id") != payload["session_id"]:
-        raise ValueError("Stored publish confirmation returned another session")
+        raise _StoredPublishMismatch(
+            "Stored publish confirmation returned another session"
+        )
     requests = sessions[0].get("requests")
     if not isinstance(requests, list) or len(requests) != 1:
-        raise ValueError("Stored publish confirmation returned another request")
+        raise _StoredPublishMismatch(
+            "Stored publish confirmation returned another request"
+        )
     stored = requests[0]
     request = stored.get("request", {})
     identity_fields = (
@@ -753,23 +832,26 @@ def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
         "evaluation_only",
     )
     if any(request.get(key) != payload[key] for key in identity_fields):
-        raise ValueError("Stored publish request identity does not match")
+        raise _StoredPublishMismatch("Stored publish request identity does not match")
     interactions = stored.get("interactions")
     if not isinstance(interactions, list) or len(interactions) != len(
         payload["interaction_data_list"]
     ):
-        raise ValueError("Stored publish interaction count does not match")
+        raise _StoredPublishMismatch("Stored publish interaction count does not match")
 
     from reflexio.models.api_schema.common import ToolUsed
     from reflexio.models.api_schema.domain.entities import InteractionData
 
-    omitted = {"citations", "image_encoding"}
+    omitted: set[str] = set(_UNVERIFIABLE_FIELDS)
     visible = (set(InteractionData.model_fields) | {"retrieved_learnings"}) - omitted
     expected = payload["interaction_data_list"]
+    unverified = tuple(
+        key for key in _UNVERIFIABLE_FIELDS if any(item.get(key) for item in expected)
+    )
+    unverified_loaded = False
     for item in expected:
         unverifiable = (
-            any(item.get(key) for key in ("citations", "image_encoding"))
-            or bool(
+            bool(
                 set(item)
                 - (set(InteractionData.model_fields) | {"retrieved_learnings"})
             )
@@ -778,8 +860,7 @@ def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
                 for tool in item.get("tools_used", [])
             )
             or any(
-                set(ref)
-                - {"kind", "learning_id", "exposure_receipt", "exposure_receipt_digest"}
+                set(ref) - _RETRIEVED_REF_KEYS
                 for ref in item.get("retrieved_learnings", [])
             )
         )
@@ -792,7 +873,9 @@ def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
             item.get("request_id") != payload["request_id"]
             or item.get("user_id") != payload["user_id"]
         ):
-            raise ValueError("Stored publish interaction identity does not match")
+            raise _StoredPublishMismatch(
+                "Stored publish interaction identity does not match"
+            )
         # Real schema defaults normalize omitted content, tool status and lists.
         # Caller-provided timestamps are part of the payload; server defaults are not.
         excluded = omitted if "created_at" in original else omitted | {"created_at"}
@@ -812,13 +895,8 @@ def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
                 if (
                     not isinstance(ref, dict)
                     or not {"kind", "learning_id"}.issubset(ref)
-                    or set(ref)
-                    - {
-                        "kind",
-                        "learning_id",
-                        "exposure_receipt",
-                        "exposure_receipt_digest",
-                    }
+                    or set(ref) - _RETRIEVED_REF_KEYS
+                    or not isinstance(ref.get("loaded", False), bool)
                     or ref["kind"] not in {"profile", "user_playbook", "agent_playbook"}
                     or not isinstance(ref["learning_id"], str)
                     or not ref["learning_id"]
@@ -830,6 +908,8 @@ def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
             target["retrieved_learnings"] = [
                 _canonical_learning_reference(ref) for ref in refs
             ]
+        if _drop_unstored_loaded_flags(observed, normalized):
+            unverified_loaded = True
         # Some installed SDKs predate ToolUsed.status even when the backend
         # exposes it. Compare raw View status using the pinned backend's coercion;
         # a legacy View that omits status cannot verify that unsupported field.
@@ -852,8 +932,44 @@ def _stored_publish_matches(raw_request: Any, payload: dict[str, Any]) -> bool:
         if json.dumps(observed, sort_keys=True, separators=(",", ":")) != json.dumps(
             normalized, sort_keys=True, separators=(",", ":")
         ):
-            raise ValueError("Stored publish interaction payload does not match")
-    return True
+            raise _StoredPublishMismatch(
+                "Stored publish interaction payload does not match"
+            )
+    if unverified_loaded:
+        unverified += ("retrieved_learnings.loaded",)
+    if unverified:
+        _LOGGER.warning(
+            "Recovered stored publish %s without verifying %s; the read API "
+            "does not return them",
+            payload["request_id"],
+            ", ".join(unverified),
+        )
+    return _StoredPublish(unverified)
+
+
+def _drop_unstored_loaded_flags(
+    observed: dict[str, Any], expected: dict[str, Any]
+) -> bool:
+    """Compare ``loaded`` only when the server stored it.
+
+    A server that predates ``RetrievedLearning.loaded`` accepts and discards
+    it, so its stored refs never carry the key. Dropping the flag from the
+    expected refs then lets an otherwise identical delivery confirm, instead
+    of wedging every later turn behind a request the server already stored.
+
+    Args:
+        observed (dict[str, Any]): Normalized stored interaction (mutated).
+        expected (dict[str, Any]): Normalized buffered interaction (mutated).
+
+    Returns:
+        bool: True when a set ``loaded`` flag could not be verified.
+    """
+    if any("loaded" in ref for ref in observed.get("retrieved_learnings", [])):
+        return False
+    dropped = False
+    for ref in expected.get("retrieved_learnings", []):
+        dropped = bool(ref.pop("loaded", None)) or dropped
+    return dropped
 
 
 def _escape_nulls(value: Any) -> Any:
@@ -938,7 +1054,17 @@ def _confirmed_publish(response: Any, request_id: str | None = None) -> PublishR
         if isinstance(response, dict)
         else getattr(response, "success", None)
     )
+    message = (
+        dict.get(response, "message")
+        if isinstance(response, dict)
+        else getattr(response, "message", None)
+    )
     if success is not True:
+        reason = (
+            dict.get(response, "error_reason")
+            if isinstance(response, dict)
+            else getattr(response, "error_reason", None)
+        )
         return PublishResult(
             False,
             request_id,
@@ -946,19 +1072,78 @@ def _confirmed_publish(response: Any, request_id: str | None = None) -> PublishR
             if success is False
             else "InvalidPublishAcknowledgement",
             http_status=200,
+            server_message=sanitize_server_message(message),
+            error_reason=reason if reason == _REQUEST_ID_CONFLICT else None,
         )
-    message = (
-        dict.get(response, "message")
-        if isinstance(response, dict)
-        else getattr(response, "message", None)
-    )
     if message == "Interaction queued for processing":
         # Legacy routes acknowledge a background task before durable storage.
         # Stable raw callers must verify the stored request before retiring it.
         return PublishResult(
             False, request_id, error_type="StorageNotConfirmed", http_status=200
         )
-    return PublishResult(True, request_id)
+    replayed = (
+        dict.get(response, "replayed")
+        if isinstance(response, dict)
+        else getattr(response, "replayed", None)
+    )
+    # A replay confirms the original stored publish; its extraction options
+    # were not rerun, exactly like a verified lost-acknowledgement recovery.
+    return PublishResult(True, request_id, recovered=replayed is True)
+
+
+_REDACTIONS = (
+    # Pydantic echoes the offending value; that can be conversation content.
+    (re.compile(r"input_value=.*?(?=, input_type=|$)"), "input_value=[redacted]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+\S+"), r"\1 [redacted]"),
+    (re.compile(r"(\w+://)[^\s/@]+@"), r"\1[redacted]@"),
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization)"
+            r"(\s*[=:]\s*)\S+"
+        ),
+        r"\1\2[redacted]",
+    ),
+)
+
+
+def sanitize_server_message(message: Any) -> str | None:
+    """Return a short, single-line server reason safe for local diagnostics.
+
+    Echoed values and credential-shaped tokens are redacted before truncation,
+    so the bounded text never carries a payload fragment or a secret.
+    """
+    if not isinstance(message, str) or not message.strip():
+        return None
+    text = " ".join(
+        "".join(char if char.isprintable() else " " for char in message).split()
+    )
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    if len(text) > _SERVER_MESSAGE_LIMIT:
+        text = text[: _SERVER_MESSAGE_LIMIT - 1] + "…"
+    return text
+
+
+def _http_error_details(response: Any) -> tuple[str | None, str | None]:
+    """Return ``(reason, sanitized message)`` from an HTTP failure body.
+
+    FastAPI wraps errors in ``detail``: a string, or for a request-ID conflict
+    ``{"reason", "request_id", "message"}``.
+    """
+    try:
+        body = response.json() if response is not None else None
+    except Exception:  # noqa: BLE001 — non-JSON bodies carry no structured reason.
+        return None, None
+    if not isinstance(body, dict):
+        return None, None
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        reason = detail.get("reason")
+        return (
+            reason if isinstance(reason, str) and len(reason) <= 64 else None,
+            sanitize_server_message(detail.get("message")),
+        )
+    return None, sanitize_server_message(detail or body.get("message"))
 
 
 def _extract_items(response: Any, field: str) -> list[Any]:

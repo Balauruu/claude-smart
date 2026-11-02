@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -888,7 +890,11 @@ def test_stop_retries_read_when_transcript_not_yet_flushed(
                     + "\n"
                 )
 
-    monkeypatch.setattr(stop, "time", SimpleNamespace(time=time.time, sleep=fake_sleep))
+    monkeypatch.setattr(
+        stop,
+        "time",
+        SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=fake_sleep),
+    )
     monkeypatch.setattr(
         "claude_smart.publish.publish_unpublished",
         lambda **_: ("nothing", 0),
@@ -921,7 +927,11 @@ def test_stop_retry_exhausts_budget_and_returns_empty(
     monkeypatch.setattr(
         stop,
         "time",
-        SimpleNamespace(time=time.time, sleep=lambda d: sleep_calls.append(d)),
+        SimpleNamespace(
+            time=time.time,
+            monotonic=time.monotonic,
+            sleep=lambda d: sleep_calls.append(d),
+        ),
     )
     monkeypatch.setattr(
         "claude_smart.publish.publish_unpublished",
@@ -1041,11 +1051,16 @@ def test_user_prompt_injects_context_when_hits_present(
     payload = json.loads(buf.getvalue().strip())
     assert payload["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     markdown = payload["hookSpecificOutput"]["additionalContext"]
-    assert "run uv sync after edits" in markdown
+    # Index line: trigger, not content; preferences show their content.
+    assert "] pyproject.toml _(open: " in markdown
+    assert "run uv sync after edits" not in markdown
     assert "prefers anyio over asyncio" in markdown
+    assert "load --session s1 <id>" in markdown
     # Prompt text is passed verbatim as the search query.
     assert calls[0]["project_id"] == "demo"
     assert calls[0]["query"] == "edit pyproject.toml"
+    # The default cap of 6 results across three collections: 2 per collection.
+    assert calls[0]["top_k"] == 2
     # Session id scopes server-side injection dedup.
     assert calls[0]["session_id"] == "s1"
     # The prompt is still buffered for downstream extraction.
@@ -1063,6 +1078,87 @@ def test_user_prompt_injects_context_when_hits_present(
         assert cite_id[0] in {"s", "p"}
         assert entry["content"]
         assert entry["title"]
+
+
+def _fifteen_hits() -> dict[str, list[dict[str, Any]]]:
+    def skills(prefix: str) -> list[dict[str, Any]]:
+        return [
+            {
+                f"{prefix}_playbook_id": f"{prefix}-{index}",
+                "content": f"FULL {prefix} {index}. " + "do the thing carefully " * 80,
+                "trigger": f"when {prefix} {index} applies " + "word " * 60,
+                "rationale": "because " + "y" * 400,
+            }
+            for index in range(1, 6)
+        ]
+
+    return {
+        "playbooks": skills("user"),
+        "agent_playbooks": skills("agent"),
+        "profiles": [
+            {"profile_id": f"profile-{index}", "content": f"pref {index} " + "z " * 800}
+            for index in range(1, 6)
+        ],
+    }
+
+
+_INDEX_ID_RE = re.compile(r"\[cs:([sp]\d+[^\]\s]*)\]")
+
+
+@pytest.mark.parametrize(
+    ("host", "hook_event", "budget"),
+    [
+        ("claude-code", "UserPromptSubmit", 8_000),
+        ("claude-code", "PreToolUse", 8_000),
+        ("codex", "UserPromptSubmit", 6_000),
+        ("codex", "PreToolUse", 6_000),
+        ("opencode", "UserPromptSubmit", 8_000),
+    ],
+)
+def test_hook_index_stays_within_host_budget_with_fifteen_items(
+    session_dir, monkeypatch, host: str, hook_event: str, budget: int
+) -> None:
+    """Every host's injection path renders bounded index lines within budget.
+
+    Claude Code caps ``additionalContext`` at 10,000 characters and Codex at
+    roughly 2,500 tokens; over either cap the model sees only a preview.
+    OpenCode receives the same string through ``hook_entry.sh opencode
+    user-prompt`` and appends it to the system prompt. Only items actually
+    shown may enter the citation registry.
+    """
+    from claude_smart.events import pre_tool
+
+    monkeypatch.setenv("CLAUDE_SMART_HOST", host)
+    # The character budget is under test, not the per-hook item cap.
+    monkeypatch.setenv("CLAUDE_SMART_MAX_INJECTED_ITEMS", "0")
+    hits = _fifteen_hits()
+    _stub_user_prompt_adapter(monkeypatch, **hits)
+    _stub_pretool_adapter(monkeypatch, **hits)
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buf)
+    if hook_event == "UserPromptSubmit":
+        user_prompt.handle({"session_id": "s1", "prompt": "edit", "cwd": "/r"})
+    else:
+        pre_tool.handle(
+            {
+                "session_id": "s1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "uv sync"},
+            }
+        )
+
+    payload = json.loads(buf.getvalue().strip())
+    assert payload["hookSpecificOutput"]["hookEventName"] == hook_event
+    context = payload["hookSpecificOutput"]["additionalContext"]
+    assert len(context) <= budget
+    assert context.startswith("Relevant learnings from claude-smart")
+    assert "bash ~/.reflexio/plugin-root/scripts/cli.sh load --session s1 <id>" in (
+        context
+    )
+    assert "FULL" not in context
+    shown_ids = set(_INDEX_ID_RE.findall(context))
+    assert len(shown_ids) == 15
+    assert set(state.read_injected("s1")) == shown_ids
 
 
 def test_user_prompt_injects_compact_context_for_codex(
@@ -1095,19 +1191,18 @@ def test_user_prompt_injects_compact_context_for_codex(
     assert payload["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert markdown.endswith("\n")
     assert "\n" not in markdown.rstrip("\n")
-    assert "claude-smart: using relevant memory. Skill:" in markdown
-    assert "Preference:" in markdown
+    assert markdown.startswith("Relevant learnings from claude-smart")
+    assert "load --session s1 <id>" in markdown
+    assert "Skill: [cs:s1] pyproject.toml (open: http://localhost:3001/rules/s1)." in (
+        markdown
+    )
+    assert "Preference: [cs:p1] prefers anyio over asyncio" in markdown
     assert "### Relevant project preferences" not in markdown
-    assert "[cs:" not in markdown
-    assert "Run uv sync after pyproject edits" in markdown
-    assert "Then run an import smoke test before committing" in markdown
-    assert "Run uv sync after pyproject edits: Run uv sync" not in markdown
-    assert "prefers anyio over asyncio" in markdown
+    assert "Run uv sync after pyproject edits" not in markdown
     assert "✨ claude-smart rule applied:" in markdown
     assert "Include only memories that materially changed the response." in markdown
     assert (
-        "✨ claude-smart rule applied: "
-        "[Run uv sync after pyproject edits](http://localhost:3001/rules/s1)"
+        "✨ claude-smart rule applied: [pyproject.toml](http://localhost:3001/rules/s1)"
     ) in markdown
     assert "\x1b]8;;" not in markdown
 
@@ -1485,12 +1580,6 @@ def test_session_start_emits_continue_without_memory_lookup(
     session_dir, monkeypatch
 ) -> None:
     class StubAdapter:
-        def apply_extraction_defaults(self, **_kw):
-            return True
-
-        def apply_optimizer_defaults(self, **_kw):
-            return True
-
         def fetch_all(self, **_kw):
             raise AssertionError("SessionStart must not fetch memory")
 
@@ -1512,12 +1601,6 @@ def test_session_start_ignores_available_memory_and_continues(
     class Stub:
         url = "http://localhost:8071/"
 
-        def apply_extraction_defaults(self, **_kw):
-            return True
-
-        def apply_optimizer_defaults(self, **_kw):
-            return True
-
         def fetch_all(self, **_kw):
             raise AssertionError("SessionStart must not fetch memory")
 
@@ -1533,239 +1616,12 @@ def test_session_start_ignores_available_memory_and_continues(
     }
 
 
-def test_session_start_applies_claude_smart_extraction_defaults(
-    session_dir, monkeypatch
-) -> None:
-    """SessionStart must push claude-smart's 5/3 extraction defaults to reflexio."""
-    applied: list[dict[str, Any]] = []
-
-    class Stub:
-        def apply_extraction_defaults(self, **kwargs):
-            applied.append(kwargs)
-            return True
-
-        def apply_optimizer_defaults(self, **_kw):
-            return True
-
-        def fetch_all(self, **_kw):
-            return ([], [], [])
-
-    monkeypatch.setattr(
-        "claude_smart.events.session_start.Adapter", lambda *a, **kw: Stub()
-    )
-    buf = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", buf)
-    session_start.handle({"session_id": "s1", "source": "startup"})
-    assert applied == [{"window_size": 5, "stride_size": 3}]
-
-
-def test_session_start_honours_extraction_env_overrides(
-    session_dir, monkeypatch
-) -> None:
-    """CLAUDE_SMART_WINDOW_SIZE / STRIDE_SIZE env vars override the defaults."""
-    # The module-level constants are read at import time, so reload after
-    # monkeypatching the env to make the overrides take effect.
-    import importlib
-
-    monkeypatch.setenv("CLAUDE_SMART_WINDOW_SIZE", "2")
-    monkeypatch.setenv("CLAUDE_SMART_STRIDE_SIZE", "1")
-    import claude_smart.events.session_start as ss
-
-    importlib.reload(ss)
-
-    applied: list[dict[str, Any]] = []
-
-    class Stub:
-        def apply_extraction_defaults(self, **kwargs):
-            applied.append(kwargs)
-            return True
-
-        def apply_optimizer_defaults(self, **_kw):
-            return True
-
-        def fetch_all(self, **_kw):
-            return ([], [], [])
-
-    monkeypatch.setattr(ss, "Adapter", lambda *a, **kw: Stub())
-    buf = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", buf)
-    try:
-        ss.handle({"session_id": "s1", "source": "startup"})
-        assert applied == [{"window_size": 2, "stride_size": 1}]
-    finally:
-        # Reload again with env unset so other tests see the real defaults.
-        monkeypatch.delenv("CLAUDE_SMART_WINDOW_SIZE", raising=False)
-        monkeypatch.delenv("CLAUDE_SMART_STRIDE_SIZE", raising=False)
-        importlib.reload(ss)
-
-
-def test_session_start_falls_back_to_defaults_on_garbage_env_values(
-    session_dir, monkeypatch
-) -> None:
-    """A non-integer env value must fall back to the default rather than
-    raising at import time. Addresses CodeRabbit review on PR #30:
-    SessionStart is the hook that wires every other hook, so an
-    import-time crash here silently disables the whole plugin.
-    """
-    import importlib
-
-    monkeypatch.setenv("CLAUDE_SMART_WINDOW_SIZE", "not-an-int")
-    monkeypatch.setenv("CLAUDE_SMART_STRIDE_SIZE", "")
-    import claude_smart.events.session_start as ss
-
-    # Must not raise on reload.
-    importlib.reload(ss)
-    try:
-        assert ss._CLAUDE_SMART_WINDOW_SIZE == 5  # default
-        assert ss._CLAUDE_SMART_STRIDE_SIZE == 3  # default
-    finally:
-        monkeypatch.delenv("CLAUDE_SMART_WINDOW_SIZE", raising=False)
-        monkeypatch.delenv("CLAUDE_SMART_STRIDE_SIZE", raising=False)
-        importlib.reload(ss)
-
-
-def test_session_start_skips_optimizer_defaults_when_opted_out(
-    session_dir, monkeypatch
-) -> None:
-    optimizer_calls: list[dict[str, Any]] = []
-
-    class Stub:
-        url = "http://localhost:8071/"
-
-        def apply_extraction_defaults(self, **_kw):
-            return True
-
-        def apply_optimizer_defaults(self, **kwargs):
-            optimizer_calls.append(kwargs)
-            return True
-
-        def fetch_all(self, **_kw):
-            return ([], [], [])
-
-    monkeypatch.setenv("CLAUDE_SMART_ENABLE_OPTIMIZER", "0")
-    monkeypatch.setattr(
-        "claude_smart.events.session_start.Adapter", lambda *a, **kw: Stub()
-    )
-    buf = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", buf)
-
-    session_start.handle({"session_id": "s1", "source": "startup"})
-
-    assert optimizer_calls == []
-
-
-def test_session_start_applies_optimizer_defaults_by_default(
-    session_dir, monkeypatch
-) -> None:
-    optimizer_calls: list[dict[str, Any]] = []
-
-    class Stub:
-        url = "http://localhost:8071/"
-
-        def apply_extraction_defaults(self, **_kw):
-            return True
-
-        def apply_optimizer_defaults(self, **kwargs):
-            optimizer_calls.append(kwargs)
-            return True
-
-        def fetch_all(self, **_kw):
-            return ([], [], [])
-
-    monkeypatch.setattr(session_start.sys, "executable", "/tmp/venv/bin/python")
-    monkeypatch.setattr(
-        "claude_smart.events.session_start.Adapter", lambda *a, **kw: Stub()
-    )
-    buf = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", buf)
-
-    session_start.handle({"session_id": "s1", "source": "startup"})
-
-    assert optimizer_calls == [
-        {
-            "script_path": "/tmp/venv/bin/claude-smart-optimizer-assistant",
-            "timeout_seconds": 300,
-        }
-    ]
-
-
-def test_session_start_skips_optimizer_defaults_for_hosted_reflexio_by_default(
-    session_dir, monkeypatch
-) -> None:
-    optimizer_calls: list[dict[str, Any]] = []
-
-    class Stub:
-        url = "https://www.reflexio.ai/"
-
-        def apply_extraction_defaults(self, **_kw):
-            return True
-
-        def apply_optimizer_defaults(self, **kwargs):
-            optimizer_calls.append(kwargs)
-            return True
-
-        def fetch_all(self, **_kw):
-            return ([], [], [])
-
-    monkeypatch.setattr(
-        "claude_smart.events.session_start.Adapter", lambda *a, **kw: Stub()
-    )
-    buf = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", buf)
-
-    session_start.handle({"session_id": "s1", "source": "startup"})
-
-    assert optimizer_calls == []
-
-
-def test_session_start_can_force_optimizer_defaults_for_hosted_reflexio(
-    session_dir, monkeypatch
-) -> None:
-    optimizer_calls: list[dict[str, Any]] = []
-
-    class Stub:
-        url = "https://www.reflexio.ai/"
-
-        def apply_extraction_defaults(self, **_kw):
-            return True
-
-        def apply_optimizer_defaults(self, **kwargs):
-            optimizer_calls.append(kwargs)
-            return True
-
-        def fetch_all(self, **_kw):
-            return ([], [], [])
-
-    monkeypatch.setenv("CLAUDE_SMART_ENABLE_OPTIMIZER", "1")
-    monkeypatch.setattr(session_start.sys, "executable", "/tmp/venv/bin/python")
-    monkeypatch.setattr(
-        "claude_smart.events.session_start.Adapter", lambda *a, **kw: Stub()
-    )
-    buf = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", buf)
-
-    session_start.handle({"session_id": "s1", "source": "startup"})
-
-    assert optimizer_calls == [
-        {
-            "script_path": "/tmp/venv/bin/claude-smart-optimizer-assistant",
-            "timeout_seconds": 300,
-        }
-    ]
-
-
 def test_session_start_never_fetches_memory_for_any_source(
     session_dir, monkeypatch
 ) -> None:
     calls: list[dict[str, Any]] = []
 
     class Stub:
-        def apply_extraction_defaults(self, **_kw):
-            return True
-
-        def apply_optimizer_defaults(self, **_kw):
-            return True
-
         def fetch_all(self, **kwargs):
             calls.append(kwargs)
             raise AssertionError("SessionStart must not fetch memory")
@@ -1863,11 +1719,15 @@ def test_pre_tool_injects_context_when_hits_present(session_dir, monkeypatch) ->
     payload = json.loads(buf.getvalue().strip())
     assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     markdown = payload["hookSpecificOutput"]["additionalContext"]
-    assert "run uv sync after edits" in markdown
+    # Index line: trigger, not content; preferences show their content.
+    assert "] pyproject.toml _(open: " in markdown
+    assert "run uv sync after edits" not in markdown
     assert "prefers anyio over asyncio" in markdown
+    assert "load --session s1 <id>" in markdown
     # Composed query must reach the adapter scoped to the project.
     assert calls[0]["project_id"] == "demo"
     assert "pyproject.toml" in calls[0]["query"]
+    assert calls[0]["top_k"] == 2
     # Session id scopes server-side injection dedup.
     assert calls[0]["session_id"] == "s1"
 
@@ -2189,3 +2049,220 @@ def test_read_only_session_end_does_not_finalize(
     monkeypatch.setenv("CLAUDE_SMART_READ_ONLY", "1")
     session_end.handle({"session_id": "saved", "cwd": "/tmp/project"})
     no_live_finalization.assert_not_called()
+
+
+def test_stop_bounds_its_synchronous_drain_inside_the_hook_limit(
+    session_dir, tmp_path, monkeypatch
+) -> None:
+    import json as _json
+    from pathlib import Path
+
+    transcript = _write_transcript(
+        tmp_path,
+        [
+            {"type": "user", "message": {"content": "hi"}},
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "ok"}]},
+            },
+        ],
+    )
+    seen: dict[str, Any] = {}
+
+    def capture(**kwargs: Any) -> tuple[str, int]:
+        seen.update(kwargs)
+        return ("nothing", 0)
+
+    monkeypatch.setattr("claude_smart.publish.publish_unpublished", capture)
+    before = time.monotonic()
+    stop.handle({"session_id": "s1", "transcript_path": str(transcript)})
+    deadline = seen["deadline"]
+    assert before < deadline <= time.monotonic() + stop._STOP_PUBLISH_BUDGET_SECONDS
+    hooks = _json.loads(
+        (Path(stop.__file__).parents[3] / "hooks" / "hooks.json").read_text()
+    )
+    host_limit = hooks["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+    # A drain that starts a batch at the latest admissible moment still records
+    # its outcome before the host kills the hook.
+    assert stop._STOP_PUBLISH_BUDGET_SECONDS < host_limit
+
+
+# -----------------------------------------------------------------------------
+# compaction reset, per-hook item cap, threshold
+# -----------------------------------------------------------------------------
+
+
+class _SearchRecorder:
+    """Adapter double whose searches record kwargs and can simulate an outage."""
+
+    def __init__(self, hits=None, *, fail: bool = False):
+        self.calls: list[dict[str, Any]] = []
+        self.read_errors: list[str] = []
+        self._hits = hits or {}
+        self._fail = fail
+
+    def search_all(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._fail:
+            self.read_errors.append("unified search: down")
+            return [], [], []
+        return (
+            list(self._hits.get("playbooks", [])),
+            list(self._hits.get("agent_playbooks", [])),
+            list(self._hits.get("profiles", [])),
+        )
+
+
+def _emit(adapter, *, session_id: str = "s1") -> str:
+    from claude_smart import context_inject
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        context_inject.emit_context(
+            session_id=session_id,
+            project_id="proj",
+            query="uv sync",
+            hook_event_name="PreToolUse",
+            top_k=5,
+            adapter=adapter,
+        )
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("source", ["startup", "resume", "clear"])
+def test_session_start_requests_reset_only_after_compaction(
+    session_dir, monkeypatch, source: str
+) -> None:
+    monkeypatch.setattr(
+        "claude_smart.events.session_start.Adapter", lambda *a, **kw: object()
+    )
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+
+    session_start.handle({"session_id": "s1", "source": source})
+    assert state.take_search_reset("s1") is False
+
+    session_start.handle({"session_id": "s1", "source": "compact"})
+    assert state.take_search_reset("s1") is True
+
+
+def test_first_search_after_compaction_resets_seen_once(session_dir) -> None:
+    state.request_search_reset("s1")
+    adapter = _SearchRecorder()
+
+    _emit(adapter)
+    _emit(adapter)
+
+    assert [call["reset_session_seen"] for call in adapter.calls] == [True, False]
+
+
+def test_failed_search_keeps_the_compaction_reset(session_dir) -> None:
+    state.request_search_reset("s1")
+
+    _emit(_SearchRecorder(fail=True))
+    healthy = _SearchRecorder()
+    _emit(healthy)
+    _emit(healthy)
+
+    assert [call["reset_session_seen"] for call in healthy.calls] == [True, False]
+
+
+def test_compaction_reset_is_per_session(session_dir) -> None:
+    state.request_search_reset("other")
+    adapter = _SearchRecorder()
+
+    _emit(adapter, session_id="s1")
+
+    assert adapter.calls[0]["reset_session_seen"] is False
+    assert state.take_search_reset("other") is True
+
+
+class _ServerLikeSearch(_SearchRecorder):
+    """Returns at most ``top_k`` hits per collection, as the server does."""
+
+    def __init__(self, per_type: int = 5):
+        hits = {
+            "playbooks": [
+                {"user_playbook_id": f"u{i}", "content": f"user skill {i}"}
+                for i in range(1, per_type + 1)
+            ],
+            "agent_playbooks": [
+                {"agent_playbook_id": f"a{i}", "content": f"shared skill {i}"}
+                for i in range(1, per_type + 1)
+            ],
+            "profiles": [
+                {"profile_id": f"p{i}", "content": f"preference {i}"}
+                for i in range(1, per_type + 1)
+            ],
+        }
+        super().__init__(hits)
+        self.returned: list[str] = []
+
+    def search_all(self, **kwargs):
+        self.calls.append(kwargs)
+        top_k = kwargs["top_k"]
+        result = tuple(
+            list(self._hits[key][:top_k])
+            for key in ("playbooks", "agent_playbooks", "profiles")
+        )
+        self.returned = [
+            str(
+                item.get("user_playbook_id")
+                or item.get("agent_playbook_id")
+                or item.get("profile_id")
+            )
+            for group in result
+            for item in group
+        ]
+        return result
+
+
+@pytest.mark.parametrize(
+    ("raw", "top_k", "total"),
+    [
+        (None, 2, 6),
+        ("", 2, 6),
+        ("bogus", 2, 6),
+        ("-3", 2, 6),
+        ("9", 3, 9),
+        ("7", 2, 6),
+        ("2", 1, 3),
+        ("0", 5, 15),
+    ],
+)
+def test_item_cap_asks_the_server_for_fewer_results(
+    session_dir, monkeypatch, raw: str | None, top_k: int, total: int
+) -> None:
+    """Everything the server returns (and marks served) is injected."""
+    if raw is None:
+        monkeypatch.delenv("CLAUDE_SMART_MAX_INJECTED_ITEMS", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_SMART_MAX_INJECTED_ITEMS", raw)
+    adapter = _ServerLikeSearch()
+
+    out = _emit(adapter)
+
+    assert adapter.calls[0]["top_k"] == top_k
+    assert len(adapter.returned) == total
+    context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    shown = _INDEX_ID_RE.findall(context)
+    assert len(shown) == total
+    injected = {entry["real_id"] for entry in state.read_injected("s1").values()}
+    assert injected == set(adapter.returned)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, None), ("", None), ("0.35", 0.35), ("1", 1.0), ("1.5", None), ("x", None)],
+)
+def test_search_threshold_is_sent_only_when_configured(
+    session_dir, monkeypatch, raw: str | None, expected: float | None
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("CLAUDE_SMART_SEARCH_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_SMART_SEARCH_THRESHOLD", raw)
+    adapter = _SearchRecorder()
+
+    _emit(adapter)
+
+    assert adapter.calls[0]["threshold"] == expected

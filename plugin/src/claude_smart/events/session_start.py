@@ -1,54 +1,15 @@
-"""SessionStart hook — apply startup defaults without broad memory retrieval."""
+"""SessionStart hook — show learning stalls without broad memory retrieval."""
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 from contextlib import suppress
-from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
-from claude_smart import hook
+from claude_smart import hook, publish_outbox, runtime, state
 from claude_smart.reflexio_adapter import Adapter
 from claude_smart.stall_banner import render_banner
-
-# Claude-smart's preferred extraction cadence — more frequent, smaller windows
-# than reflexio's out-of-box 10/5. Applied idempotently to the reflexio server
-# on every SessionStart via Adapter.apply_extraction_defaults.
-#
-# Env-var overrides let benchmark harnesses (SWE-bench Verified, in particular)
-# run with ``CLAUDE_SMART_STRIDE_SIZE=1`` so a single short autonomous session
-# triggers extraction on its sole publish instead of being silently filtered
-# out by the stride pre-filter (``new < stride_size``). Production users keep
-# the defaults; the values are only read on SessionStart, so a launcher that
-# sets the env var has predictable effect for the entire Claude Code session.
-#
-# Parsing is defensive: a non-integer env value falls back to the default
-# rather than raising at import time. SessionStart is the hook that wires up
-# every subsequent hook, so an import-time crash here would silently disable
-# the whole plugin for the session.
-
-
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-_CLAUDE_SMART_WINDOW_SIZE = _int_env("CLAUDE_SMART_WINDOW_SIZE", 5)
-_CLAUDE_SMART_STRIDE_SIZE = _int_env("CLAUDE_SMART_STRIDE_SIZE", 3)
-# Optimizer defaults are local-only by default because they store an absolute
-# path to the claude-smart helper process. Set this env var to "1" to force
-# enabling against a non-local Reflexio URL, or "0" to disable everywhere.
-_OPTIMIZER_ENV = "CLAUDE_SMART_ENABLE_OPTIMIZER"
-_OPTIMIZER_TIMEOUT_SECONDS = 300
-_LOCAL_REFLEXIO_HOSTS = {"", "localhost", "127.0.0.1", "::1"}
 
 
 def _adapter() -> Adapter:
@@ -98,26 +59,30 @@ def _stall_banner(adapter: Any) -> str:
 
 
 def handle(payload: dict[str, Any]) -> None:
+    """SessionStart dispatcher: stall banner, plus a reset after compaction.
+
+    Args:
+        payload (dict[str, Any]): Host hook payload; ``source`` is
+            ``"compact"`` when Claude Code or Codex just compacted the chat.
+    """
+    if runtime.is_codex():
+        publish_outbox.kick()
     session_id = payload.get("session_id")
     if not session_id:
         hook.emit_continue()
         return
+
+    if payload.get("source") == "compact":
+        # Compaction keeps the session id, so the server's per-session dedup
+        # would keep withholding rules that just left the model's context.
+        with suppress(Exception):
+            state.request_search_reset(session_id)
 
     adapter = _adapter()
 
     # Stall banner — prepended to additionalContext, fires at most once per
     # stall event (controlled server-side via mark_stall_notified).
     banner = _stall_banner(adapter)
-
-    adapter.apply_extraction_defaults(
-        window_size=_CLAUDE_SMART_WINDOW_SIZE,
-        stride_size=_CLAUDE_SMART_STRIDE_SIZE,
-    )
-    if _should_apply_optimizer_defaults(adapter):
-        adapter.apply_optimizer_defaults(
-            script_path=_optimizer_assistant_path(),
-            timeout_seconds=_OPTIMIZER_TIMEOUT_SECONDS,
-        )
 
     if not banner:
         hook.emit_continue()
@@ -137,26 +102,3 @@ def handle(payload: dict[str, Any]) -> None:
 
     with suppress(Exception):
         adapter.mark_stall_notified()
-
-
-def _optimizer_assistant_path() -> str:
-    executable = Path(sys.executable)
-    suffix = ".exe" if os.name == "nt" else ""
-    return str(executable.with_name(f"claude-smart-optimizer-assistant{suffix}"))
-
-
-def _should_apply_optimizer_defaults(adapter: Any) -> bool:
-    flag = os.environ.get(_OPTIMIZER_ENV, "").strip().lower()
-    if flag in {"0", "false", "no", "off"}:
-        return False
-    if flag in {"1", "true", "yes", "on"}:
-        return True
-    return _is_local_reflexio_url(getattr(adapter, "url", ""))
-
-
-def _is_local_reflexio_url(url: str) -> bool:
-    if not url:
-        return True
-    parsed = urlparse(url)
-    host = parsed.hostname if parsed.scheme else url.split(":", 1)[0]
-    return (host or "").lower() in _LOCAL_REFLEXIO_HOSTS

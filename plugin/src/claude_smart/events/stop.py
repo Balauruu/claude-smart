@@ -1,4 +1,4 @@
-"""Stop hook — finalize the current assistant turn, publish to reflexio."""
+"""Stop hook — save the assistant turn and queue or publish it to reflexio."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from typing import Any
 
 from claude_smart import (
     cs_cite,
-    env_config,
     ids,
     internal_call,
     publish,
+    publish_outbox,
     runtime,
     state,
 )
@@ -38,6 +38,11 @@ _PLAN_REJECTION_MARKER = "The user doesn't want to proceed"
 _PLAN_REJECTION_COMMENT_MARKER = "the user said:"
 
 _EXIT_PLAN_MODE_TOOL = "ExitPlanMode"
+
+# The synchronous drain must finish, including writing the watermark, inside
+# the host's 30-second Stop hook limit (``hooks/hooks.json``). Measured from
+# handler entry; the rest covers interpreter start-up and the dispatcher log.
+_STOP_PUBLISH_BUDGET_SECONDS = 20.0
 
 
 def _read_transcript_entries(path: Path) -> list[dict[str, Any]]:
@@ -339,19 +344,20 @@ def _registry_entry_for_citation(
 
 
 def handle(payload: dict[str, Any]) -> tuple[publish.PublishStatus, int] | None:
-    """Drain the buffered assistant turn to reflexio.
+    """Save the assistant turn; queue Codex publication or drain synchronously.
 
     Args:
         payload (dict[str, Any]): Claude Code hook payload.
 
     Returns:
         tuple[PublishStatus, int] | None: The ``(status, count)`` tuple
-            from ``publish.publish_unpublished`` so the dispatcher can
-            include it in the forensic hook log. ``None`` is returned
+            from publication (or ``("queued", 0)`` after durable Codex enqueue)
+            so the dispatcher can log the outcome. ``None`` is returned
             only when the handler short-circuits before publishing (no
             ``session_id`` in the payload, or Codex internal-prompt
             detection skipped the fire).
     """
+    deadline = time.monotonic() + _STOP_PUBLISH_BUDGET_SECONDS
     session_id = payload.get("session_id")
     if not session_id:
         return None
@@ -364,17 +370,33 @@ def handle(payload: dict[str, Any]) -> tuple[publish.PublishStatus, int] | None:
     transcript_path = payload.get("transcript_path")
     project_id = ids.resolve_user_id(payload.get("cwd"))
 
+    last_assistant_message = payload.get("last_assistant_message")
+    native_message = (
+        runtime.is_codex()
+        and isinstance(last_assistant_message, str)
+        and bool(last_assistant_message)
+    )
+    prompt = payload.get("prompt") or ""
+    if native_message and not prompt:
+        buffered = state.read_all(session_id)
+        unpublished = state.published_record_offset(buffered)
+        prompt = next(
+            (
+                record.get("content", "")
+                for record in reversed(buffered[unpublished:])
+                if record.get("role") == "User"
+            ),
+            "",
+        )
     entries: list[dict[str, Any]] = []
-    if transcript_path:
+    if transcript_path and (not native_message or not prompt):
         path = Path(transcript_path)
         if path.is_file():
             entries = _load_transcript_with_retry(path)
-
-    prompt = payload.get("prompt") or _scan_transcript_for_user_text(entries)
+    prompt = prompt or _scan_transcript_for_user_text(entries)
     if runtime.is_codex() and internal_call.is_codex_internal_prompt(prompt):
         return None
 
-    last_assistant_message = payload.get("last_assistant_message")
     assistant_text = (
         last_assistant_message
         if (runtime.is_codex() or runtime.is_opencode())
@@ -433,12 +455,18 @@ def handle(payload: dict[str, Any]) -> tuple[publish.PublishStatus, int] | None:
     if cited_items:
         record["cited_items"] = cited_items
     state.append(session_id, record)
-    if env_config.env_truthy(env_config.CLAUDE_SMART_READ_ONLY_ENV):
+    if publish_outbox.read_only():
         state.mark_all_published(session_id)
         return ("nothing", 0)
+    if runtime.is_codex():
+        return (
+            "queued" if publish_outbox.enqueue(session_id, project_id) else "failed",
+            0,
+        )
     return publish.publish_unpublished(
         session_id=session_id,
         project_id=project_id,
         force_extraction=False,
         skip_aggregation=False,
+        deadline=deadline,
     )

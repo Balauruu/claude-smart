@@ -58,6 +58,8 @@ def _isolated_env(tmp_path: Path) -> dict[str, str]:
     env["SHELL"] = "/bin/sh"
     env.pop("BASH_ENV", None)
     env.pop("ENV", None)
+    # Retention matrix cases supply their own policy, independent of the shell.
+    env.pop("REFLEXIO_ROW_LIMIT_INTERACTIONS", None)
     # These fixtures exercise the native per-agent workers and their rollback
     # contracts. The guided coordinator is covered separately in test_install_guide.
     env["CLAUDE_SMART_INSTALL_CHILD"] = "1"
@@ -90,6 +92,7 @@ def _write_bootstrap_uv(path: Path, *, mode: str) -> None:
         f"  cat > \"$PWD/.venv/bin/python\" <<'PYSH'\n"
         "#!/bin/sh\n"
         'if [ "$1" = "-P" ]; then shift; fi\n'
+        'case "$1" in */backend-inference-owner.py) [ "${CLAUDE_SMART_TEST_INFERENCE_OWNER:-}" != "exit" ] || exit 1; printf "%s\\n" "${CLAUDE_SMART_TEST_INFERENCE_OWNER:-colocated}"; exit 0 ;; esac\n'
         'if [ "$1" = "-" ] && [ "$2" = "onnxruntime" ] && [ -n "${CLAUDE_SMART_TEST_ONNXRUNTIME_IMPORT_STATUS:-}" ]; then\n'
         '  exit "$CLAUDE_SMART_TEST_ONNXRUNTIME_IMPORT_STATUS"\n'
         "fi\n"
@@ -471,7 +474,11 @@ def test_backend_service_forces_utf8_stdio_for_managed_backend() -> None:
 def test_backend_service_uses_prepared_venv_reflexio_cli() -> None:
     service = (REPO_ROOT / "plugin" / "scripts" / "backend-service.sh").read_text()
 
-    assert 'backend_python="$(claude_smart_plugin_python "$PLUGIN_ROOT")"' in service
+    assert 'claude_smart_prepare_backend_import_context "$PLUGIN_ROOT"' in service
+    assert (
+        'backend_python="$(claude_smart_plugin_python "$plugin_root")"'
+        in LIB.read_text()
+    )
     assert '"$backend_python" "$HERE/backend-python-runner.py"' in service
     assert "-- services start" in service
     assert 'uv run --project "$PLUGIN_ROOT" --no-sync --quiet' not in service
@@ -481,7 +488,7 @@ def test_backend_service_uses_prepared_venv_reflexio_cli() -> None:
         'uv pip install --project "$PLUGIN_ROOT" --python "$plugin_python" '
         '--quiet --reinstall --no-deps "$vendor"'
     ) in service
-    assert 'vendor_pythonpath="$VENDORED_REFLEXIO"' in service
+    assert 'vendor_pythonpath="$plugin_root/vendor/reflexio"' in LIB.read_text()
     assert 'verify_bundled_reflexio_import "$backend_python"' in service
     assert 'PYTHONPATH="$backend_pythonpath"' in service
 
@@ -740,7 +747,6 @@ def test_smart_install_repairs_local_env_defaults() -> None:
 
     assert 'touch "$REFLEXIO_ENV"' in script
     assert "CLAUDE_SMART_USE_LOCAL_CLI" in script
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" in script
     assert "CLAUDE_SMART_READ_ONLY=0" in script
     assert "CLAUDE_SMART_HOST=claude-code" in script
     assert "CLAUDE_SMART_USE_LOCAL_CLI=" in script.split("install_complete()", 1)[1]
@@ -1101,7 +1107,7 @@ def test_installer_mode_matches_runtime_resolution(
     # A local report must leave the local backend its provider defaults.
     if not installer_managed:
         assert "CLAUDE_SMART_USE_LOCAL_CLI=" in final_text, context
-        assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=" in final_text, context
+        assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in final_text, context
     if "REFLEXIO_URL" in final_text and "REFLEXIO_URL" not in file_text:
         assert re.search(r'^REFLEXIO_API_KEY="?[^"\s]', final_text, re.MULTILINE), (
             context
@@ -1234,8 +1240,11 @@ def test_no_code_path_uses_the_shared_reflexio_env_file() -> None:
     assert offenders == []
 
 
-def _run_setup_script(tmp_path: Path, stdin: str) -> subprocess.CompletedProcess[str]:
+def _run_setup_script(
+    tmp_path: Path, stdin: str, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = _isolated_env(tmp_path)
+    env.update(env_extra or {})
     env["CLAUDE_SMART_SETUP_NO_INSTALL"] = "1"
     return subprocess.run(
         ["/bin/bash", str(SETUP_CLAUDE_SMART)],
@@ -1255,7 +1264,7 @@ def test_setup_script_local_mode_creates_env(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     text = (tmp_path / ".claude-smart" / ".env").read_text()
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in text
 
 
@@ -1319,7 +1328,7 @@ def test_setup_script_local_mode_cleans_managed_keys(tmp_path: Path) -> None:
     assert "REFLEXIO_API_KEY" not in text
     assert "REFLEXIO_USER_ID" not in text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert "CLAUDE_SMART_READ_ONLY=1" in text
     assert 'CLAUDE_SMART_READ_ONLY="0"' not in text
 
@@ -1335,7 +1344,7 @@ def test_setup_script_local_mode_replaces_managed_only_env(tmp_path: Path) -> No
     text = env_path.read_text()
     assert "REFLEXIO_API_KEY" not in text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in text
 
 
@@ -1540,9 +1549,7 @@ def test_node_installer_ignores_stale_url_without_api_key(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     assert (
-        "CLAUDE_SMART_USE_LOCAL_CLI, "
-        "CLAUDE_SMART_USE_LOCAL_EMBEDDING, CLAUDE_SMART_READ_ONLY, "
-        "CLAUDE_SMART_HOST.\n"
+        "CLAUDE_SMART_USE_LOCAL_CLI, CLAUDE_SMART_READ_ONLY, REFLEXIO_ROW_LIMIT_INTERACTIONS, CLAUDE_SMART_HOST.\n"
     ) in result.stdout
     assert "Using local Reflexio backend at http://localhost:8071/." in result.stdout
     # ~/.reflexio/.env belongs to other Reflexio tools: never rewritten.
@@ -1550,7 +1557,7 @@ def test_node_installer_ignores_stale_url_without_api_key(tmp_path: Path) -> Non
     runtime_text = claude_smart_env_path.read_text()
     assert "REFLEXIO_URL" not in runtime_text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in runtime_text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in runtime_text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in runtime_text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in runtime_text
     assert "CLAUDE_SMART_HOST=opencode" in runtime_text
 
@@ -1592,7 +1599,7 @@ def test_node_installer_updates_existing_host_and_local_defaults(
     assert "CLAUDE_SMART_HOST=opencode" in text
     assert "CLAUDE_SMART_HOST=codex" not in text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=0" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert 'CLAUDE_SMART_READ_ONLY="1"' in text
 
 
@@ -2724,6 +2731,17 @@ def test_commit_survives_an_undeletable_previous_package(tmp_path: Path) -> None
     assert "claude-smart installed and dependencies are prepared" in result.stdout
 
 
+def _seed_opencode_v2_loader(target: Path) -> Path:
+    """Write the generated V2 loader the installer would produce."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "// claude-smart OpenCode V2 loader\n"
+        "// OpenCode V2 auto-loads this directory. Reinstall claude-smart to refresh.\n"
+        'export { default } from "file:///tmp/claude-smart/plugin/opencode/dist/server.mjs";\n'
+    )
+    return target
+
+
 def test_node_opencode_uninstall_hands_the_host_back_to_claude_code(
     tmp_path: Path,
 ) -> None:
@@ -2749,6 +2767,8 @@ def test_node_opencode_uninstall_hands_the_host_back_to_claude_code(
     project.mkdir()
     (project / "opencode.json").write_text('{"plugin": []}\n')
     env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    project_loader = _seed_opencode_v2_loader(project / ".opencode" / "plugins" / "claude-smart.js")
 
     result = subprocess.run(
         [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode"],
@@ -2762,6 +2782,116 @@ def test_node_opencode_uninstall_hands_the_host_back_to_claude_code(
     assert result.returncode == 0, result.stderr
     assert link.resolve() == claude_root.resolve()
     assert 'CLAUDE_SMART_HOST="claude-code"' in runtime_env.read_text()
+    # Nothing else references the shared package, so uninstall removes it.
+    assert not project_loader.exists()
+    assert not opencode_root.exists()
+
+
+def test_node_opencode_project_uninstall_keeps_the_shared_package(
+    tmp_path: Path,
+) -> None:
+    # Both scopes share one package copy and every loader re-exports its
+    # server.mjs, so a project-scoped uninstall must not delete the package a
+    # surviving --global loader still imports.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Node installer test")
+    package_root = tmp_path / ".claude-smart" / "opencode" / "claude-smart" / "plugin"
+    (package_root / "scripts").mkdir(parents=True)
+    _write_executable(package_root / "scripts" / "backend-service.sh", "#!/bin/sh\nexit 0\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "opencode.json").write_text('{"plugin": []}\n')
+    project_loader = _seed_opencode_v2_loader(project / ".opencode" / "plugins" / "claude-smart.js")
+    env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    global_loader = _seed_opencode_v2_loader(tmp_path / "xdg" / "opencode" / "plugins" / "claude-smart.js")
+
+    result = subprocess.run(
+        [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode"],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not project_loader.exists()
+    assert global_loader.exists()
+    assert (package_root / "scripts" / "backend-service.sh").exists()
+
+
+def test_node_opencode_global_uninstall_keeps_the_shared_package(
+    tmp_path: Path,
+) -> None:
+    # The mirror case: a --global uninstall must not delete the package that a
+    # project loader in the same tree still imports.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Node installer test")
+    package_root = tmp_path / ".claude-smart" / "opencode" / "claude-smart" / "plugin"
+    (package_root / "scripts").mkdir(parents=True)
+    _write_executable(package_root / "scripts" / "backend-service.sh", "#!/bin/sh\nexit 0\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    project_loader = _seed_opencode_v2_loader(project / ".opencode" / "plugins" / "claude-smart.js")
+    env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    global_loader = _seed_opencode_v2_loader(tmp_path / "xdg" / "opencode" / "plugins" / "claude-smart.js")
+
+    result = subprocess.run(
+        [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode", "--global"],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not global_loader.exists()
+    assert project_loader.exists()
+    assert (package_root / "scripts" / "backend-service.sh").exists()
+
+
+def test_node_opencode_global_uninstall_reads_every_project_config_form(
+    tmp_path: Path,
+) -> None:
+    # A project can reference the shared package from a second config form that
+    # `opencodeConfigPath` does not pick: the object form, in .opencode, and in
+    # .jsonc. A --global uninstall must still see it and keep the package.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Node installer test")
+    package_root = tmp_path / ".claude-smart" / "opencode" / "claude-smart" / "plugin"
+    (package_root / "scripts").mkdir(parents=True)
+    _write_executable(package_root / "scripts" / "backend-service.sh", "#!/bin/sh\nexit 0\n")
+    (package_root / "opencode.json").write_text("{}\n")
+    project = tmp_path / "project"
+    (project / ".opencode").mkdir(parents=True)
+    # An unrelated root config takes precedence in opencodeConfigPath and hides it.
+    (project / "opencode.json").write_text('{"plugin": []}\n')
+    package_url = f"file://{package_root.parent}"
+    (project / ".opencode" / "opencode.jsonc").write_text(
+        '{\n  // object-form entry\n  "plugins": [{ "package": "%s" }]\n}\n' % package_url
+    )
+    env = _isolated_env(tmp_path)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    global_loader = _seed_opencode_v2_loader(tmp_path / "xdg" / "opencode" / "plugins" / "claude-smart.js")
+
+    result = subprocess.run(
+        [node, str(NODE_INSTALLER), "uninstall", "--host", "opencode", "--global"],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not global_loader.exists()
+    assert (package_root / "scripts" / "backend-service.sh").exists()
 
 
 def test_windows_interrupt_ends_the_whole_child_tree(tmp_path: Path) -> None:
@@ -3066,8 +3196,10 @@ def test_node_claude_uninstall_never_leaves_plugin_root_dangling(
         assert not link.is_symlink() and not link.exists()
 
 
+@pytest.mark.parametrize("external_runtime", [False, True])
 def test_node_claude_uninstall_repoints_plugin_root_at_newest_codex(
     tmp_path: Path,
+    external_runtime: bool,
 ) -> None:
     # 0.2.10 is newer than 0.2.9; a lexical sort would pick 0.2.9.
     node = shutil.which("node")
@@ -3083,6 +3215,12 @@ def test_node_claude_uninstall_repoints_plugin_root_at_newest_codex(
         _write_executable(
             root / "scripts" / "backend-service.sh", "#!/bin/sh\nexit 0\n"
         )
+    runtime = tmp_path / ".codex" / "claude-smart" / "runtime" / "plugin"
+    if external_runtime:
+        (runtime / "scripts").mkdir(parents=True)
+        _write_executable(runtime / "scripts/backend-service.sh", "#!/bin/sh\nexit 0\n")
+    config = tmp_path / ".claude-smart" / ".env"
+    config.write_text("CLAUDE_SMART_HOST=claude-code\n")
     link = tmp_path / ".reflexio" / "plugin-root"
     link.parent.mkdir()
     link.symlink_to(claude_root, target_is_directory=True)
@@ -3101,7 +3239,49 @@ def test_node_claude_uninstall_repoints_plugin_root_at_newest_codex(
     )
 
     assert result.returncode == 0, result.stderr
-    assert link.resolve() == (codex_cache / "0.2.10").resolve()
+    expected = runtime if external_runtime else codex_cache / "0.2.10"
+    assert link.resolve() == expected.resolve()
+    assert 'CLAUDE_SMART_HOST="codex"' in config.read_text()
+
+
+def test_codex_uninstall_stops_external_runtime_before_removing_it(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Node installer test")
+    package_root = _fake_claude_code_package(tmp_path, "#!/bin/sh\nexit 0\n")
+    runtime = tmp_path / ".codex" / "claude-smart" / "runtime" / "plugin"
+    (runtime / "scripts").mkdir(parents=True)
+    for service in ["backend", "dashboard"]:
+        _write_executable(
+            runtime / "scripts" / f"{service}-service.sh",
+            '#!/bin/sh\n[ -d "$(dirname "$0")" ] || exit 1\n'
+            'printf "%s %s\\n" "$0" "$*" >> "$HOME/runtime-stops.log"\n',
+        )
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "codex", "#!/bin/sh\nexit 0\n")
+    env = _isolated_env(tmp_path)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        [
+            node,
+            str(package_root / "bin/claude-smart.js"),
+            "uninstall",
+            "--host",
+            "codex",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    stops = (tmp_path / "runtime-stops.log").read_text()
+    for service in ["backend", "dashboard"]:
+        assert f"{runtime}/scripts/{service}-service.sh stop" in stops
+    assert not runtime.exists()
 
 
 def test_node_install_survives_an_invalid_service_port(tmp_path: Path) -> None:
@@ -3515,8 +3695,13 @@ def test_backend_service_verifies_bundled_reflexio_runtime_identity() -> None:
     assert "module.relative_to(vendor)" in backend
     assert "reflexio import resolved outside bundled vendor" in backend
     assert "bundled Reflexio import preflight failed" in backend
-    assert 'vendor_pythonpath="$VENDORED_REFLEXIO"' in backend
-    assert 'vendor_pythonpath="$VENDORED_REFLEXIO_FOR_PYTHON"' in backend
+    assert 'claude_smart_prepare_backend_import_context "$PLUGIN_ROOT"' in backend
+    shared = LIB.read_text()
+    assert 'vendor_pythonpath="$plugin_root/vendor/reflexio"' in shared
+    assert (
+        'vendor_pythonpath="$(claude_smart_to_windows_path "$vendor_pythonpath")"'
+        in shared
+    )
     assert (
         'verify_bundled_reflexio_import "$backend_python" "$backend_pythonpath" "$VENDORED_REFLEXIO_FOR_PYTHON"'
         in backend
@@ -3561,8 +3746,22 @@ def test_backend_python_runner_exposes_metadata_and_forwards_reflexio_args(
         "}))\n"
     )
     output = tmp_path / "out.json"
-    env = os.environ.copy()
-    env.update({"OUT": str(output), "PYTHONPATH": str(tmp_path)})
+    # This stub exercises argument forwarding, not a configured organization.
+    # Real SDK imports elsewhere in the suite may initialize routing defaults.
+    # Account routing and HOME must not enter a metadata-only child process.
+    env = {
+        key: os.environ[key]
+        for key in ("PATH", "LANG", "SYSTEMROOT", "COMSPEC")
+        if key in os.environ
+    }
+    env.update(
+        {
+            "HOME": str(tmp_path),
+            "USERPROFILE": str(tmp_path),
+            "OUT": str(output),
+            "PYTHONPATH": str(tmp_path),
+        }
+    )
 
     result = subprocess.run(
         [
@@ -3638,7 +3837,10 @@ def test_installers_start_backend_and_refresh_dashboard_services() -> None:
     assert (
         "startAndReportServices(pluginRoot, HOST_CLAUDE_CODE, setup)" in node_installer
     )
-    assert "startAndReportServices(cacheDir, HOST_CODEX, setup)" in node_installer
+    assert (
+        "startAndReportServices(CODEX_RUNTIME_PLUGIN_ROOT, HOST_CODEX, setup)"
+        in node_installer
+    )
     assert (
         'runPluginService(pluginRoot, "dashboard-service.sh", "stop")' in node_installer
     )
@@ -4353,7 +4555,9 @@ def test_smart_install_locked_sync_success_does_not_refresh_lock(
     ]
 
 
-def test_smart_install_persists_local_embedding_override(tmp_path: Path) -> None:
+def test_smart_install_does_not_persist_retired_embedding_export(
+    tmp_path: Path,
+) -> None:
     _plugin_root, smart_install, env = _prepare_smart_install_sync_fixture(
         tmp_path,
         mode="fresh",
@@ -4371,7 +4575,7 @@ def test_smart_install_persists_local_embedding_override(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
     text = (tmp_path / ".claude-smart" / ".env").read_text()
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=0" in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
 
 
 def test_smart_install_rerun_preserves_existing_host(tmp_path: Path) -> None:
@@ -4695,7 +4899,7 @@ def test_smart_install_repairs_reflexio_template_env_drift(tmp_path: Path) -> No
     env_text = reflexio_env.read_text()
     assert "OPENAI_API_KEY=" in env_text
     assert "CLAUDE_SMART_USE_LOCAL_CLI=1" in env_text
-    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING=1" in env_text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in env_text
     assert 'CLAUDE_SMART_READ_ONLY="0"' in env_text
     assert (tmp_path / "uv.log").read_text().count(
         "sync --locked --python 3.12 --quiet"
@@ -4720,7 +4924,8 @@ def test_backend_service_configures_shared_embedding_daemon() -> None:
     backend = (REPO_ROOT / "plugin" / "scripts" / "backend-service.sh").read_text()
 
     assert 'EMBEDDING_PORT="${EMBEDDING_PORT:-8072}"' in backend
-    assert "REFLEXIO_EMBEDDING_PROVIDER:-local_service" in backend
+    assert "REFLEXIO_EMBEDDING_PROVIDER:-local_service" not in backend
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in backend
     assert "export REFLEXIO_EMBEDDING_SERVICE_URL" not in backend
 
 
@@ -5987,7 +6192,7 @@ def test_codex_hook_recovers_missing_dependencies_without_cli_command() -> None:
     script = CODEX_HOOK.read_text()
 
     assert "function startInstallerDetached(root, reason)" in script
-    assert 'startInstallerDetached(root, "hook: uv not on PATH")' in script
+    assert 'startInstallerDetached(root, "hook: prepared Python missing")' in script
     assert "function runServiceScript(root, scriptName, action, logName)" in script
     assert 'path.join(root, "scripts", scriptName)' in script
     assert "[script, action]" in script
@@ -6606,6 +6811,19 @@ process.stdin.on("data", (chunk) => {
     const message = JSON.parse(line);
     if (!message.id) continue;
     if (message.method === "hooks/list") {
+      const path = require("path");
+      const cache = path.join(process.env.CODEX_HOME || `${home}/.codex`, "plugins/cache/reflexioai/claude-smart");
+      const validate = (dir) => {
+        for (const name of fs.readdirSync(dir)) {
+          const file = path.join(dir, name), stat = fs.lstatSync(file);
+          if (stat.isDirectory()) validate(file);
+          else if (!stat.isFile()) throw new Error(`unsupported plugin entry type: ${file}`);
+        }
+      };
+      // Real Codex validates the installed version, not inactive cache entries.
+      const manifest = JSON.parse(fs.readFileSync(path.join(home,
+        ".claude/plugins/marketplaces/reflexioai/plugin/.codex-plugin/plugin.json"), "utf8"));
+      validate(path.join(cache, manifest.version));
       process.stdout.write(JSON.stringify({
         id: message.id,
         result: {
@@ -6692,6 +6910,8 @@ def _npm_install_global_tarball(
 
 def _install_opencode_tarball_fixture(
     tmp_path: Path,
+    foreign_global_loader: str | None = None,
+    log_service_calls: bool = False,
 ) -> tuple[Path, Path, Path, Path, dict[str, str], subprocess.CompletedProcess[str]]:
     if os.name == "nt":
         pytest.skip("tarball smoke uses POSIX npm bin paths")
@@ -6716,6 +6936,18 @@ def _install_opencode_tarball_fixture(
         '#!/bin/sh\nprintf "npm %s\\n" "$*" >> "$HOME/npm.log"\nexit 0\n',
     )
     _write_bootstrap_uv(uv_bin / "uv", mode="fresh")
+    if log_service_calls:
+        # Record service-script calls without running them, so the test never
+        # touches a real backend or dashboard on the host.
+        _write_executable(
+            fake_bin / "bash",
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            '  *-service.sh) printf "%s %s\\n" "$(basename "$1")" "$2" '
+            '>> "$HOME/service-calls.log"; exit 0 ;;\n'
+            "esac\n"
+            'exec /bin/bash "$@"\n',
+        )
 
     env = os.environ.copy()
     test_path = (
@@ -6733,6 +6965,11 @@ def _install_opencode_tarball_fixture(
         }
     )
     _npm_install_global_tarball(tarball, prefix=prefix, env=env)
+
+    if foreign_global_loader is not None:
+        loader = xdg / "opencode" / "plugins" / "claude-smart.js"
+        loader.parent.mkdir(parents=True, exist_ok=True)
+        loader.write_text(foreign_global_loader)
 
     result = subprocess.run(
         [
@@ -6792,7 +7029,6 @@ def _assert_installed_host_learning_e2e(
             "PYTHONPATH": os.pathsep.join(pythonpath_entries),
             "CLAUDE_SMART_STATE_DIR": str(home / ".claude-smart" / f"{host}-sessions"),
             "CLAUDE_SMART_HOOK_LOG": str(home / ".claude-smart" / f"{host}-hook.log"),
-            "CLAUDE_SMART_ENABLE_OPTIMIZER": "0",
             "CLAUDE_SMART_BACKEND_AUTOSTART": "0",
             "CLAUDE_SMART_DASHBOARD_AUTOSTART": "0",
         }
@@ -6901,9 +7137,11 @@ def test_claude_code_fresh_tarball_install_prepares_stable_copy(
 
 
 @pytest.mark.parametrize("custom_home", [False, True])
+@pytest.mark.parametrize("reinstall", [False, True])
 def test_codex_fresh_tarball_install_prepares_cache_and_trusts_hooks(
     tmp_path: Path,
     custom_home: bool,
+    reinstall: bool,
 ) -> None:
     if os.name == "nt":
         pytest.skip("tarball smoke uses POSIX npm bin paths")
@@ -6924,7 +7162,12 @@ def test_codex_fresh_tarball_install_prepares_cache_and_trusts_hooks(
     _write_executable(private_node / "node", "#!/bin/sh\nprintf 'v20.9.0\\n'\n")
     _write_executable(
         private_node / "npm",
-        '#!/bin/sh\nprintf "npm %s\\n" "$*" >> "$HOME/npm.log"\nexit 0\n',
+        '#!/bin/sh\nprintf "npm %s\\n" "$*" >> "$HOME/npm.log"\n'
+        'if [ "$1" = "ci" ]; then\n'
+        "  mkdir -p node_modules/.bin node_modules/acorn/bin\n"
+        '  printf "#!/bin/sh\\nexit 0\\n" > node_modules/acorn/bin/acorn\n'
+        "  ln -sf ../acorn/bin/acorn node_modules/.bin/acorn\n"
+        "fi\nexit 0\n",
     )
     _write_bootstrap_uv(uv_bin / "uv", mode="fresh")
 
@@ -6972,15 +7215,57 @@ def test_codex_fresh_tarball_install_prepares_cache_and_trusts_hooks(
     cache_plugin = (
         codex_home / "plugins" / "cache" / "reflexioai" / "claude-smart" / version
     )
+    if reinstall:
+        # Reproduce a previously bootstrapped cache, including the rejected
+        # npm entry. Reinstall must replace it without reusing dependencies.
+        old_bin = cache_plugin / "dashboard" / "node_modules" / ".bin"
+        old_bin.mkdir(parents=True)
+        (old_bin / "acorn").symlink_to("../acorn/bin/acorn")
+        inactive = cache_plugin.parent / "0.3.14" / "dashboard/node_modules/.bin"
+        inactive.mkdir(parents=True)
+        (inactive / "acorn").symlink_to("../acorn/bin/acorn")
+        result = subprocess.run(
+            [str(prefix / "bin" / "claude-smart"), "install", "--host", "codex"],
+            cwd=project,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (inactive / "acorn").is_symlink()
     for root in [marketplace_plugin, cache_plugin]:
         assert (root / "pyproject.toml").exists()
         assert (root / "uv.lock").exists()
         assert (root / "scripts" / "hook_entry.sh").exists()
         assert (root / "opencode" / "dist" / "server.mjs").exists()
         _assert_matching_smart_install_hash(root, installed_package)
-    assert (cache_plugin / ".venv" / "bin" / "python").exists()
+    runtime_plugin = codex_home / "claude-smart" / "runtime" / "plugin"
+    assert (runtime_plugin / ".venv" / "bin" / "python").exists()
+    assert (runtime_plugin / "dashboard/node_modules/.bin/acorn").is_symlink()
+    for root in [marketplace_plugin, cache_plugin]:
+        assert not (root / ".venv").exists()
+        assert not (root / "dashboard" / "node_modules").exists()
+        assert not any(p.is_symlink() for p in root.rglob("*"))
+    manifest = json.loads((cache_plugin / "hooks" / "codex-hooks.json").read_text())
+    ensure_root = manifest["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert "--runtime-root" in ensure_root
+    # Codex sets these variables to the validated package, not the runtime.
+    hook_env = {
+        **env,
+        "PLUGIN_ROOT": str(cache_plugin),
+        "CLAUDE_PLUGIN_ROOT": str(cache_plugin),
+    }
+    # The private-node stub only reports a version; execute with the real Node.
+    hook_argv = shlex.split(ensure_root)
+    hook_argv[0] = node
+    hook_result = subprocess.run(
+        hook_argv, env=hook_env, capture_output=True, text=True, timeout=10
+    )
+    assert hook_result.returncode == 0, hook_result.stderr
+    assert (home / ".reflexio" / "plugin-root").resolve() == runtime_plugin.resolve()
     _assert_installed_host_learning_e2e(
-        cache_plugin,
+        runtime_plugin,
         host="codex",
         home=home,
         tmp_path=tmp_path,
@@ -7136,13 +7421,20 @@ def test_opencode_fresh_tarball_install_uses_local_file_plugin(
 
     assert result.returncode == 0, result.stderr
     assert "claude-smart OpenCode support is installed." in result.stdout
-    config = json.loads((xdg / "opencode" / "opencode.json").read_text())
-    assert len(config["plugin"]) == 1
-    plugin_spec = config["plugin"][0]
-    assert plugin_spec.startswith("file://")
-    assert plugin_spec != "claude-smart"
+    # One load path: the global loader is written; no config entry is created.
+    assert not (xdg / "opencode" / "opencode.json").exists()
+    loader_text = (xdg / "opencode" / "plugins" / "claude-smart.js").read_text()
+    entry = json.loads(
+        loader_text.splitlines()[2]
+        .removeprefix("export { default } from ")
+        .removesuffix(";")
+    )
+    assert entry.startswith("file://")
+    assert entry != "claude-smart"
 
-    local_package = Path(plugin_spec.removeprefix("file://"))
+    local_package = Path(
+        entry.removeprefix("file://").removesuffix("/plugin/opencode/dist/server.mjs")
+    )
     installed_package = prefix / "lib" / "node_modules" / "claude-smart"
     local_script = local_package / "plugin" / "scripts" / "smart-install.sh"
     assert local_script.exists()
@@ -7158,6 +7450,40 @@ def test_opencode_fresh_tarball_install_uses_local_file_plugin(
     assert "uv sync --locked --python 3.12 --quiet" in (home / "uv.log").read_text()
 
 
+def test_opencode_tarball_install_conflict_fails_loudly(
+    tmp_path: Path,
+) -> None:
+    # A hand-written plugin squatting the loader path is a conflict: install
+    # must fail and must not claim the host is installed.
+    foreign = "// hand-written plugin, not a claude-smart loader\nexport default {};\n"
+    _home, _prefix, _project, xdg, _env, result = _install_opencode_tarball_fixture(
+        tmp_path, foreign_global_loader=foreign
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "claude-smart OpenCode support is installed." not in result.stdout
+    assert "not a claude-smart loader" in result.stderr
+    # The squatter is left untouched, not clobbered.
+    assert (xdg / "opencode" / "plugins" / "claude-smart.js").read_text() == foreign
+
+
+def test_opencode_tarball_install_conflict_leaves_shared_services_running(
+    tmp_path: Path,
+) -> None:
+    # The install started and stopped nothing, so a conflict must not stop a
+    # backend or dashboard that a global install is already running.
+    foreign = "// hand-written plugin, not a claude-smart loader\nexport default {};\n"
+    home, _prefix, _project, _xdg, _env, result = _install_opencode_tarball_fixture(
+        tmp_path, foreign_global_loader=foreign, log_service_calls=True
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "not a claude-smart loader" in result.stderr
+    calls = home / "service-calls.log"
+    logged = calls.read_text().splitlines() if calls.exists() else []
+    assert not [line for line in logged if line.endswith(" stop")], logged
+
+
 def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
     tmp_path: Path,
 ) -> None:
@@ -7167,8 +7493,15 @@ def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
     assert install_result.returncode == 0, install_result.stderr
 
     config_path = xdg / "opencode" / "opencode.json"
-    plugin_spec = json.loads(config_path.read_text())["plugin"][0]
-    local_package = Path(plugin_spec.removeprefix("file://"))
+    loader_path = xdg / "opencode" / "plugins" / "claude-smart.js"
+    entry = json.loads(
+        loader_path.read_text().splitlines()[2]
+        .removeprefix("export { default } from ")
+        .removesuffix(";")
+    )
+    local_package = Path(
+        entry.removeprefix("file://").removesuffix("/plugin/opencode/dist/server.mjs")
+    )
     assert local_package.exists()
 
     session_file = home / ".claude-smart" / "sessions" / "keep.jsonl"
@@ -7177,13 +7510,15 @@ def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
     reflexio_data.parent.mkdir(parents=True)
     session_file.write_text("{}\n")
     reflexio_data.write_text("keep\n")
+    # A legacy config still carries entries the uninstall must clean up.
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
         json.dumps(
             {
                 "plugin": [
                     "other-plugin",
                     "claude-smart",
-                    plugin_spec,
+                    local_package.as_uri(),
                 ],
                 "theme": "system",
             }
@@ -7212,6 +7547,9 @@ def test_opencode_fresh_tarball_uninstall_removes_plugin_and_keeps_data(
         "plugin": ["other-plugin"],
         "theme": "system",
     }
+    # The loader must not stay behind: it re-exports the package just removed,
+    # so leaving it would break every later OpenCode start.
+    assert not loader_path.exists()
     assert not local_package.exists()
     assert not (home / ".claude-smart" / "opencode").exists()
     assert session_file.exists()
@@ -7436,8 +7774,10 @@ def test_node_installer_preserves_occupied_plugin_root(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("ownership", ["colocated", "attached", "invalid", "exit"])
 def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
     tmp_path: Path,
+    ownership: str,
 ) -> None:
     node = shutil.which("node")
     if not node:
@@ -7476,6 +7816,7 @@ def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
                 f"{fake_bin}:/bin:/usr/bin:{os.environ.get('PATH', '')}"
             ),
             "CLAUDE_SMART_TEST_ONNXRUNTIME_IMPORT_STATUS": "1",
+            "CLAUDE_SMART_TEST_INFERENCE_OWNER": ownership,
             "SHELL": "",
         }
     )
@@ -7483,7 +7824,7 @@ def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
         f"const installer = require({json.dumps(str(NODE_INSTALLER))});"
         f"installer.bootstrapPluginRuntime({json.dumps(str(plugin_root))}, "
         "{ patchCodexHooks: false })"
-        ".then(() => { console.error('unexpected success'); process.exit(1); })"
+        ".then(() => { process.exit(0); })"
         ".catch((err) => { console.error(err.message); process.exit(2); });"
     )
 
@@ -7497,11 +7838,20 @@ def test_node_installer_windows_local_embedding_preflight_surfaces_marker(
     )
 
     marker = home / ".claude-smart" / "install-failed"
+    if ownership == "attached":
+        assert result.returncode == 0, result.stderr
+        assert not marker.exists()
+        return
     assert result.returncode == 2
-    assert "Windows local embedding requires Microsoft Visual C++" in result.stderr
+    expected = {
+        "colocated": "Windows local embedding requires Microsoft Visual C++",
+        "invalid": "Invalid inference ownership result",
+        "exit": "Unable to determine inference ownership",
+    }[ownership]
+    assert expected in result.stderr
     assert marker.exists()
     marker_text = marker.read_text()
-    assert "Windows local embedding requires Microsoft Visual C++" in marker_text
+    assert expected in marker_text
     assert "fingerprint=" in marker_text
     assert "verify-windows-embedding" in (home / "bash.log").read_text()
     npm_log = home / "npm.log"
@@ -8189,6 +8539,15 @@ def test_codex_hook_post_tool_fallback_omits_suppress_output(tmp_path: Path) -> 
     assert json.loads(result.stdout) == {"continue": True}
 
 
+def _prepared_hook_root(tmp_path: Path, body: str) -> Path:
+    root = tmp_path / "plugin"
+    python = root / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    (root / "pyproject.toml").write_text("[project]\nname='claude-smart'\n")
+    _write_executable(python, body)
+    return root
+
+
 def test_codex_hook_reflexio_env_file_overrides_stale_managed_process_env(
     tmp_path: Path,
 ) -> None:
@@ -8211,21 +8570,17 @@ def test_codex_hook_reflexio_env_file_overrides_stale_managed_process_env(
         'REFLEXIO_URL="https://localhost:8081"\nREFLEXIO_API_KEY="rflx-dev"\n'
     )
 
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    uv = bin_dir / "uv"
-    uv.write_text(
+    root = _prepared_hook_root(
+        tmp_path,
         "#!/bin/sh\n"
         'printf \'{"hookSpecificOutput":{"hookEventName":"PostToolUse",'
         '"additionalContext":"%s|%s|%s|%s"}}\\n\' '
         '"$REFLEXIO_URL" "$REFLEXIO_API_KEY" '
-        '"$CLAUDE_SMART_USE_LOCAL_CLI" "$CLAUDE_SMART_READ_ONLY"\n'
+        '"$CLAUDE_SMART_USE_LOCAL_CLI" "$CLAUDE_SMART_READ_ONLY"\n',
     )
-    uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
-
     env = _isolated_env(tmp_path)
-    env["PATH"] = str(bin_dir)
-    env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT / "plugin")
+    env["PATH"] = str(root / ".venv" / "bin")
+    env["CLAUDE_PLUGIN_ROOT"] = str(root)
     env["REFLEXIO_URL"] = "https://stale.example/"
     env["REFLEXIO_API_KEY"] = "rflx-stale-secret"
     env["CLAUDE_SMART_USE_LOCAL_CLI"] = "env-local"
@@ -8254,17 +8609,13 @@ def test_codex_hook_normalizer_removes_suppress_output_for_hooks(
     if not node:
         pytest.skip("node is required for codex hook wrapper tests")
 
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    uv = bin_dir / "uv"
-    uv.write_text(
-        "#!/bin/sh\nprintf '%s\\n' '{\"continue\":true,\"suppressOutput\":true}'\n"
+    root = _prepared_hook_root(
+        tmp_path,
+        "#!/bin/sh\nprintf '%s\\n' '{\"continue\":true,\"suppressOutput\":true}'\n",
     )
-    uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
-
     env = _isolated_env(tmp_path)
-    env["PATH"] = str(bin_dir)
-    env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT / "plugin")
+    env["PATH"] = str(root / ".venv" / "bin")
+    env["CLAUDE_PLUGIN_ROOT"] = str(root)
     result = subprocess.run(
         [node, str(CODEX_HOOK), "hook", "post-tool"],
         env=env,
@@ -8283,20 +8634,16 @@ def test_codex_hook_defaults_citation_links_to_markdown(tmp_path: Path) -> None:
     if not node:
         pytest.skip("node is required for codex hook wrapper tests")
 
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    uv = bin_dir / "uv"
-    uv.write_text(
+    root = _prepared_hook_root(
+        tmp_path,
         "#!/bin/sh\n"
         'printf \'%s\\n\' "{\\"hookSpecificOutput\\":'
         '{\\"hookEventName\\":\\"UserPromptSubmit\\",'
-        '\\"additionalContext\\":\\"$CLAUDE_SMART_CITATION_LINK_STYLE\\"}}"\n'
+        '\\"additionalContext\\":\\"$CLAUDE_SMART_CITATION_LINK_STYLE\\"}}"\n',
     )
-    uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
-
     env = _isolated_env(tmp_path)
-    env["PATH"] = str(bin_dir)
-    env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT / "plugin")
+    env["PATH"] = str(root / ".venv" / "bin")
+    env["CLAUDE_PLUGIN_ROOT"] = str(root)
     env.pop("CLAUDE_SMART_CITATION_LINK_STYLE", None)
     result = subprocess.run(
         [node, str(CODEX_HOOK), "hook", "user-prompt"],
@@ -8407,7 +8754,7 @@ def test_local_legacy_runtime_flags_migrate_without_connection_keys(
 ) -> None:
     legacy = tmp_path / ".reflexio" / ".env"
     legacy.parent.mkdir()
-    original = 'REFLEXIO_URL="http://localhost:8081/"\nREFLEXIO_API_KEY="other-server-key"\nCLAUDE_SMART_READ_ONLY="1"\nCLAUDE_SMART_CLI_TIMEOUT="90"\n'
+    original = 'REFLEXIO_URL="http://localhost:8081/"\nREFLEXIO_API_KEY="other-server-key"\nCLAUDE_SMART_READ_ONLY="1"\nCLAUDE_SMART_CLI_TIMEOUT="90"\nCLAUDE_SMART_USE_LOCAL_EMBEDDING=1\n'
     legacy.write_text(original)
     runtime = tmp_path / ".claude-smart" / ".env"
     if runtime_read_only is not None:
@@ -8431,6 +8778,7 @@ def test_local_legacy_runtime_flags_migrate_without_connection_keys(
     assert f'CLAUDE_SMART_READ_ONLY="{expected}"' in text
     assert 'CLAUDE_SMART_CLI_TIMEOUT="90"' in text
     assert "other-server-key" not in text
+    assert "CLAUDE_SMART_USE_LOCAL_EMBEDDING" not in text
     assert legacy.read_text() == original
 
 
@@ -8611,6 +8959,107 @@ def test_status_distinguishes_install_from_account_scoped_observations(
     assert result.returncode == 0
     assert "unknown (host inventory unavailable)" in result.stdout
     assert "active version is unknown" in result.stdout
+
+
+_DISABLED_HOOK_CONFIG = """\
+model = "gpt-6"
+
+[hooks.state]
+
+[hooks.state."claude-smart@reflexioai:hooks/codex-hooks.json:session_start:0:3"]
+enabled = true
+trusted_hash = "sha256:aaa"
+
+[hooks.state."claude-smart@reflexioai:hooks/codex-hooks.json:user_prompt_submit:0:0"]
+enabled = false
+trusted_hash = "sha256:bbb"
+
+[hooks.state."other@market:hooks/hooks.json:stop:0:0"]
+enabled = false
+
+[hooks.state.inline]
+"claude-smart@reflexioai:hooks/codex-hooks.json:pre_tool_use:0:0" = { enabled = false }
+
+[features]
+enabled = false
+"""
+
+
+def test_codex_status_warns_about_disabled_claude_smart_hooks_read_only(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "codex", "#!/bin/sh\nexit 1\n")
+    account = tmp_path / "account home"
+    account.mkdir()
+    config = account / "config.toml"
+    config.write_text(_DISABLED_HOOK_CONFIG)
+    before = config.read_bytes()
+    env = _isolated_env(tmp_path)
+    env.update(CODEX_HOME=str(account))
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+
+    def status() -> str:
+        result = subprocess.run(
+            [node, str(NODE_INSTALLER), "status", "--host", "codex"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    out = status()
+
+    assert config.read_bytes() == before
+    assert "1 claude-smart Codex hook is disabled" in out
+    assert (
+        "claude-smart@reflexioai:hooks/codex-hooks.json:user_prompt_submit:0:0 "
+        "(user_prompt_submit)"
+    ) in out
+    assert "session_start" not in out
+    assert "other@market" not in out
+    assert "/hooks" in out and "enabled = true" in out
+
+    config.write_text(
+        _DISABLED_HOOK_CONFIG.replace("enabled = false", "enabled = true")
+    )
+    assert "disabled" not in status()
+    config.unlink()
+    assert "disabled" not in status()
+
+
+def test_disabled_codex_hooks_reads_section_and_inline_forms(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        _DISABLED_HOOK_CONFIG.replace("[hooks.state.inline]\n", "[hooks.state]\n")
+    )
+    script = (
+        "const m = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(m.disabledCodexHooks(process.argv[2])));"
+    )
+    result = subprocess.run(
+        [node, "-e", script, str(NODE_INSTALLER), str(config)],
+        env=_isolated_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=40,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        "claude-smart@reflexioai:hooks/codex-hooks.json:pre_tool_use:0:0",
+        "claude-smart@reflexioai:hooks/codex-hooks.json:user_prompt_submit:0:0",
+    ]
 
 
 def test_python_installer_uses_codex_account_home(tmp_path: Path) -> None:
@@ -8847,3 +9296,151 @@ def test_status_attributes_each_claude_registration_to_its_scope(
             in result.stdout
         )
         assert "Installed version: 3.0.0 (scope: user, enabled: true)" in result.stdout
+
+
+@pytest.mark.parametrize("saved", [None, "0", "4300"])
+@pytest.mark.parametrize("exported", [None, "9000"])
+def test_local_install_preserves_canonical_retention_budget(
+    tmp_path, monkeypatch, saved, exported
+):
+    from importlib.metadata import distribution
+
+    monkeypatch.setenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", "123456")
+    _plugin_root, installer, env = _prepare_smart_install_sync_fixture(
+        tmp_path, mode="fresh"
+    )
+    selected = tmp_path / ".claude-smart/.env"
+    selected.parent.mkdir(exist_ok=True)
+    original = "# keep policy\nUNKNOWN=keep\n"
+    if saved is not None:
+        original += f"REFLEXIO_ROW_LIMIT_INTERACTIONS={saved}\n"
+    selected.write_text(original)
+    if exported is not None:
+        env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+    result = _run_smart_install(installer, env)
+    assert result.returncode == 0, result.stderr
+    stored = saved if saved is not None else exported or "500"
+    text = selected.read_text()
+    assert original.strip() in text
+    assert text.count("REFLEXIO_ROW_LIMIT_INTERACTIONS=") == 1
+    assert f"REFLEXIO_ROW_LIMIT_INTERACTIONS={stored}" in text
+    backend = (REPO_ROOT / "plugin/scripts/backend-service.sh").read_text()
+    assert "INTERACTION_CLEANUP_THRESHOLD" not in backend
+    assert "INTERACTION_CLEANUP_DELETE_COUNT" not in backend
+    # Execute both real SDK policies, without starting compute or services.
+    probe = (
+        "from reflexio.cli.env_loader import block_implicit_dotenv_walkup, load_reflexio_env; "
+        "block_implicit_dotenv_walkup(); load_reflexio_env(); "
+        "from reflexio.server.services.storage.retention import get_row_retention_limits; "
+        "print(get_row_retention_limits()['interactions'])"
+    )
+    for sdk in (
+        REPO_ROOT / "plugin/vendor/reflexio",
+        Path(str(distribution("reflexio-ai").locate_file(""))),
+    ):
+        probe_env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "PYTHONPATH": str(sdk),
+            "REFLEXIO_ENV_FILE": str(selected),
+        }
+        if exported is not None:
+            probe_env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+        checked = subprocess.run(
+            [sys.executable, "-P", "-c", probe],
+            env=probe_env,
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        assert checked.returncode == 0, checked.stderr
+        assert checked.stdout.strip().splitlines()[-1] == (exported or stored)
+
+
+@pytest.mark.parametrize(
+    "installer", ["node-codex", "node-opencode", "python", "bash", "smart-install"]
+)
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        None,
+        "REFLEXIO_ROW_LIMIT_INTERACTIONS=0",
+        "REFLEXIO_ROW_LIMIT_INTERACTIONS=4300",
+        "REFLEXIO_ROW_LIMIT_INTERACTIONS = 0",
+        "  REFLEXIO_ROW_LIMIT_INTERACTIONS=4300",
+        '  export REFLEXIO_ROW_LIMIT_INTERACTIONS = "0"',
+    ],
+)
+@pytest.mark.parametrize("exported", [None, "9000"])
+def test_local_retention_defaults_preserve_dotenv_policy_across_installers(
+    tmp_path, monkeypatch, installer, assignment, exported
+):
+    from claude_smart.env_config import ensure_local_env_defaults, parse_env_line
+    from dotenv import dotenv_values
+    from io import StringIO
+
+    selected = tmp_path / ".claude-smart/.env"
+    selected.parent.mkdir()
+    original = "# policy\nUNKNOWN=keep\n" + (
+        assignment + "\n" if assignment is not None else ""
+    )
+    selected.write_text(original)
+    monkeypatch.setenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", "123456")
+    env = _isolated_env(tmp_path)
+    if exported is not None:
+        env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+    if installer.startswith("node-"):
+        host = installer.removeprefix("node-")
+        result = subprocess.run(
+            [
+                "node",
+                "-e",
+                f"require({str(NODE_INSTALLER)!r}).configureReflexioSetup({host!r})",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+    elif installer == "python":
+        if exported is None:
+            monkeypatch.delenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", raising=False)
+        else:
+            monkeypatch.setenv("REFLEXIO_ROW_LIMIT_INTERACTIONS", exported)
+        ensure_local_env_defaults(selected, host="codex")
+        result = subprocess.CompletedProcess([], 0, "", "")
+    elif installer == "bash":
+        result = _run_setup_script(
+            tmp_path,
+            "codex\nlocal\n",
+            env_extra={"REFLEXIO_ROW_LIMIT_INTERACTIONS": exported}
+            if exported
+            else None,
+        )
+    else:
+        # This fixture prepares only its plugin/toolchain, retaining our saved policy.
+        _root, script, env = _prepare_smart_install_sync_fixture(tmp_path, mode="fresh")
+        if exported is not None:
+            env["REFLEXIO_ROW_LIMIT_INTERACTIONS"] = exported
+        result = _run_smart_install(script, env)
+    assert result.returncode == 0, result.stderr
+    text = selected.read_text()
+    assert original.strip() in text
+    parsed = [parse_env_line(line) for line in text.splitlines()]
+    caps = [
+        value
+        for pair in parsed
+        if pair is not None
+        for key, value in [pair]
+        if key == "REFLEXIO_ROW_LIMIT_INTERACTIONS"
+    ]
+    assert len(caps) == 1
+    expected = (
+        dotenv_values(stream=StringIO(original)).get("REFLEXIO_ROW_LIMIT_INTERACTIONS")
+        if assignment is not None
+        else exported or "500"
+    )
+    assert caps == [expected]
+    assert dotenv_values(selected)["REFLEXIO_ROW_LIMIT_INTERACTIONS"] == expected

@@ -56,18 +56,9 @@ export REFLEXIO_ENV_FILE="$HOME/.claude-smart/.env"
 # reranker model, even if a shared Reflexio env file enables it.
 export REFLEXIO_RERANK_ENABLED=false
 
-# Default: route extraction through the active host CLI + ONNX embedder
-# so claude-smart works without any LLM API key. Users can opt out by
-# pre-exporting these to 0.
+# The authenticated host CLI retains its own opt-in. Embedding execution is
+# selected by the SDK's model/endpoint policy, without a second plugin toggle.
 export CLAUDE_SMART_USE_LOCAL_CLI="${CLAUDE_SMART_USE_LOCAL_CLI:-1}"
-export CLAUDE_SMART_USE_LOCAL_EMBEDDING="${CLAUDE_SMART_USE_LOCAL_EMBEDDING:-1}"
-if [ "${CLAUDE_SMART_USE_LOCAL_EMBEDDING:-}" = "1" ]; then
-  export REFLEXIO_EMBEDDING_PROVIDER="${REFLEXIO_EMBEDDING_PROVIDER:-local_service}"
-  # Do NOT default REFLEXIO_EMBEDDING_SERVICE_URL. Reflexio derives
-  # 127.0.0.1:$EMBEDDING_PORT itself, and since reflexio#425 its launcher
-  # treats ANY configured URL as a remote service and skips starting the
-  # local daemon -- defaulting it here left every install without embeddings.
-fi
 # The backend can be spawned from contexts whose PATH lacks the host
 # CLI dir (commonly ~/.local/bin or /opt/homebrew/bin). Pin the CLI
 # explicitly if we can resolve it from our own (post-login-path) PATH.
@@ -545,8 +536,31 @@ backend_current_or_compatible() {
   return 1
 }
 
+# Reuse the installed SDK's actual launcher decision, including on older pinned
+# runtimes. A failed query is neither evidence of attachment nor permission to kill.
+inference_ownership=""
+resolve_inference_ownership() {
+  case "$inference_ownership" in
+    colocated|attached) return 0 ;;
+    unavailable) return 1 ;;
+  esac
+  prepare_backend_import_context
+  if ! inference_ownership="$(cd "$PLUGIN_ROOT" && PYTHONPATH="$backend_pythonpath" \
+    "$backend_python" "$HERE/backend-inference-owner.py")"; then
+    inference_ownership="unavailable"
+    return 1
+  fi
+  # Native Windows Python emits CRLF; command substitution strips only LF.
+  inference_ownership="${inference_ownership%$'\r'}"
+  case "$inference_ownership" in
+    colocated|attached) return 0 ;;
+    *) inference_ownership="unavailable"; return 1 ;;
+  esac
+}
+
 embedding_owned_by_current_vendor() {
-  [ "${CLAUDE_SMART_USE_LOCAL_EMBEDDING:-}" = "1" ] || return 0
+  resolve_inference_ownership || return 1
+  [ "$inference_ownership" = "colocated" ] || return 0
   pids="$(claude_smart_port_listener_pids "$EMBEDDING_PORT")"
   for pid in $pids; do
     if is_claude_smart_backend_pid "$pid" && pid_uses_current_vendor_root "$pid"; then
@@ -557,7 +571,8 @@ embedding_owned_by_current_vendor() {
 }
 
 embedding_current_or_compatible() {
-  [ "${CLAUDE_SMART_USE_LOCAL_EMBEDDING:-}" = "1" ] || return 0
+  resolve_inference_ownership || return 1
+  [ "$inference_ownership" = "colocated" ] || return 0
   pids="$(claude_smart_port_listener_pids "$EMBEDDING_PORT")"
   for pid in $pids; do
     if is_claude_smart_backend_pid "$pid" && backend_pid_current_or_compatible "$pid"; then
@@ -599,19 +614,7 @@ PY
 }
 
 prepare_backend_import_context() {
-  backend_pythonpath="${PYTHONPATH:-}"
-  if [ -d "$VENDORED_REFLEXIO/reflexio" ]; then
-    vendor_pythonpath="$VENDORED_REFLEXIO"
-    pythonpath_sep=":"
-    if claude_smart_is_windows; then
-      # Native Windows Python expects ;-separated Windows-style paths in
-      # PYTHONPATH; MSYS does not auto-convert arbitrary env vars.
-      pythonpath_sep=";"
-      vendor_pythonpath="$VENDORED_REFLEXIO_FOR_PYTHON"
-    fi
-    backend_pythonpath="$vendor_pythonpath${backend_pythonpath:+$pythonpath_sep$backend_pythonpath}"
-  fi
-  backend_python="$(claude_smart_plugin_python "$PLUGIN_ROOT")"
+  claude_smart_prepare_backend_import_context "$PLUGIN_ROOT"
 }
 
 # Repair the vendored install if its version drifted, then prove this plugin
@@ -669,7 +672,11 @@ stop_stale_backend_listener_if_owned() {
 }
 
 stop_stale_embedding_listener_if_owned() {
-  [ "${CLAUDE_SMART_USE_LOCAL_EMBEDDING:-}" = "1" ] || return 0
+  if ! resolve_inference_ownership; then
+    echo "[claude-smart] inference ownership unavailable; skipping embedding cleanup" >&2
+    return 1
+  fi
+  [ "$inference_ownership" = "colocated" ] || return 0
   pids="$(claude_smart_port_listener_pids "$EMBEDDING_PORT")"
   [ -n "$pids" ] || return 0
   ours=""
@@ -956,12 +963,8 @@ case "$CMD" in
     fi
     cd "$PLUGIN_ROOT"
 
-    # Cap local interaction history to keep the SQLite store small for
-    # claude-smart users. Reflexio's library defaults are much higher
-    # (250k/50k) for server deployments; here we override only in the
-    # claude-smart plugin context. Users can still override via env.
-    export INTERACTION_CLEANUP_THRESHOLD="${INTERACTION_CLEANUP_THRESHOLD:-500}"
-    export INTERACTION_CLEANUP_DELETE_COUNT="${INTERACTION_CLEANUP_DELETE_COUNT:-200}"
+    # Retention policy comes from the selected SDK environment. The installer
+    # records the plugin's local budget there using its canonical setting.
 
     # Keep plugin runtime data in ~/.reflexio even when the backend imports
     # Reflexio from an editable checkout inside a larger repo with its own

@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
+
+# npm installs the pinned vendor after the PyPI baseline with --no-deps.
+# CI materializes that same bundle: test it consistently in this process too,
+# rather than mixing old PyPI imports with strict-vendor subprocesses.
+_vendor = Path(__file__).resolve().parents[1] / "plugin/vendor/reflexio"
+if (_vendor / "reflexio").is_dir():
+    sys.path.insert(0, str(_vendor))
 
 
 @pytest.fixture
@@ -14,8 +24,7 @@ def session_dir(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clear_install_environment(monkeypatch, tmp_path):
-    """Keep optimizer setup and live account paths out of isolated installs."""
-    monkeypatch.delenv("CLAUDE_SMART_ENABLE_OPTIMIZER", raising=False)
+    """Keep live account paths out of isolated installs."""
     # Isolated HOME subprocesses must never inherit a live Orca/Codex account.
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CLAUDE_SMART_HOOK_LOG", raising=False)
@@ -58,3 +67,11 @@ def reset_runtime_host(monkeypatch):
     runtime.set_host(runtime.HOST_CLAUDE_CODE)
     yield
     runtime.set_host(runtime.HOST_CLAUDE_CODE)
+
+
+@pytest.fixture(autouse=True)
+def no_background_publish_process(monkeypatch):
+    """Unit tests must not start a real worker against inherited account routing."""
+    from claude_smart import publish_outbox
+
+    monkeypatch.setattr(publish_outbox, "_spawn_worker", lambda _token: None)

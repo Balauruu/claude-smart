@@ -558,7 +558,10 @@ def test_packaged_guide_installs_multiple_agents_and_reuses_saved_provider(
     cache = (
         home / ".codex" / "plugins" / "cache" / "reflexioai" / "claude-smart" / version
     )
-    assert (cache / ".venv" / "bin" / "python").is_file()
+    assert (cache / "hooks" / "codex-hooks.json").is_file()
+    assert not (cache / ".venv").exists()
+    runtime = home / ".codex" / "claude-smart" / "runtime" / "plugin"
+    assert (runtime / ".venv" / "bin" / "python").is_file()
     assert (
         home
         / ".claude-smart"
@@ -620,7 +623,10 @@ def test_actual_codex_node_hook_uses_selected_learning_provider(
         "printf '{\"continue\":true}\\n'\n"
     )
     _write_executable(scripts / "backend-service.sh", recorder)
-    _write_executable(fake_bin / "uv", recorder)
+    prepared_python = root / ".venv" / "bin" / "python"
+    prepared_python.parent.mkdir(parents=True)
+    _write_executable(prepared_python, recorder)
+    _write_executable(fake_bin / "uv", "#!/bin/sh\nexit 99\n")
     env = guide_env(tmp_path)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["CLAUDE_PLUGIN_ROOT"] = str(root)

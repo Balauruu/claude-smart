@@ -13,6 +13,8 @@ Exposes the following subcommands:
   (as markdown).
 - ``learn``: publish unpublished interactions and force reflexio
   extraction now over the active session buffer.
+- ``load``: print the full text of a ``[cs:ID]`` item a hook injected as an
+  index line. The model runs it through ``context_format.LOADER_COMMAND``.
 - ``restart``: stop and restart the reflexio backend + dashboard services
   (rebuilding the dashboard bundle) so local Reflexio checkout edits or
   ``plugin/dashboard/`` edits take effect without restarting Claude Code.
@@ -22,12 +24,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import queue
 import re
-import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -41,12 +45,15 @@ from claude_smart import (
     context_format,
     cs_cite,
     env_config,
+    hook_log,
     ids,
     publish,
     runtime,
     state,
 )
 from claude_smart.reflexio_adapter import Adapter
+
+_LOGGER = logging.getLogger(__name__)
 
 _HOST_CLAUDE_CODE = runtime.HOST_CLAUDE_CODE
 _HOST_CODEX = runtime.HOST_CODEX
@@ -267,20 +274,27 @@ def _force_plugin_root(plugin_root: Path) -> None:
     except OSError:
         if link.exists():
             raise
-        (_REFLEXIO_DIR / "plugin-root.txt").write_text(f"{plugin_root}\n")
+        (_REFLEXIO_DIR / "plugin-root.txt").write_text(
+            f"{plugin_root}\n", encoding="utf-8"
+        )
 
 
 def _active_plugin_root() -> Path | None:
-    link = _REFLEXIO_DIR / "plugin-root"
+    """Mirror ``activePluginRoot`` in bin/claude-smart.js."""
     try:
-        return link.resolve(strict=True) if link.is_symlink() else None
+        root: Path | None = (_REFLEXIO_DIR / "plugin-root").resolve(strict=True)
     except OSError:
-        pass
-    try:
-        text = (_REFLEXIO_DIR / "plugin-root.txt").read_text().strip()
-    except OSError:
+        # _force_plugin_root falls back to plugin-root.txt where symlinks fail.
+        try:
+            text = (
+                (_REFLEXIO_DIR / "plugin-root.txt").read_text(encoding="utf-8").strip()
+            )
+        except OSError:
+            return None
+        root = Path(text) if text else None
+    if root is None or not (root / "scripts" / "backend-service.sh").is_file():
         return None
-    return Path(text) if text else None
+    return root
 
 
 def _plugin_root_is_broken() -> bool:
@@ -294,7 +308,7 @@ def _plugin_root_is_broken() -> bool:
         except OSError:
             return True
     try:
-        text = (_REFLEXIO_DIR / "plugin-root.txt").read_text().strip()
+        text = (_REFLEXIO_DIR / "plugin-root.txt").read_text(encoding="utf-8").strip()
     except OSError:
         return False
     return bool(text) and not has_runtime(Path(text))
@@ -725,26 +739,48 @@ def _set_codex_hook_states(path: Path, states: dict[str, str]) -> bool:
     return True
 
 
+def _codex_stdout_lines(proc: subprocess.Popen[str]) -> queue.Queue[str | None]:
+    """Pump ``proc.stdout`` lines into a queue from a daemon thread.
+
+    A thread rather than ``select()``: select cannot see lines already held in
+    the TextIOWrapper buffer, and does not support pipes on Windows. ``None``
+    marks EOF, i.e. the child closed stdout or exited.
+    """
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("Codex app-server stdout pipe is not available")
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for line in stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=pump, name="codex-app-server-stdout", daemon=True).start()
+    return lines
+
+
 def _read_codex_app_server_response(
-    proc: subprocess.Popen[str], response_id: int, deadline: float
+    lines: queue.Queue[str | None], response_id: int, deadline: float
 ) -> dict[str, object]:
-    """Read JSON-RPC lines from ``proc.stdout`` until ``response_id`` arrives.
+    """Read JSON-RPC lines from ``lines`` until ``response_id`` arrives.
 
     Skips unrelated notifications and non-JSON output. Raises ``RuntimeError``
     if the child exits, ``TimeoutError`` once ``deadline`` is reached, or
     re-raises Codex's own error payload as ``RuntimeError``.
     """
-    if proc.stdout is None:
-        raise RuntimeError("Codex app-server stdout pipe is not available")
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], 0.2)
-        if not ready:
-            if proc.poll() is not None:
-                raise RuntimeError("Codex app-server exited before responding")
-            continue
-        line = proc.stdout.readline()
-        if not line:
-            continue
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            line = lines.get(timeout=remaining)
+        except queue.Empty:
+            break
+        if line is None:
+            lines.put(None)  # keep EOF visible to any later read
+            raise RuntimeError("Codex app-server exited before responding")
         try:
             message = json.loads(line)
         except json.JSONDecodeError:
@@ -758,6 +794,7 @@ def _read_codex_app_server_response(
 
 def _codex_app_server_request(
     proc: subprocess.Popen[str],
+    lines: queue.Queue[str | None],
     response_id: int,
     method: str,
     params: dict[str, object],
@@ -771,7 +808,7 @@ def _codex_app_server_request(
     )
     proc.stdin.write("\n")
     proc.stdin.flush()
-    return _read_codex_app_server_response(proc, response_id, deadline)
+    return _read_codex_app_server_response(lines, response_id, deadline)
 
 
 def _list_codex_plugin_hooks(cwd: Path) -> tuple[bool, list[dict[str, object]], str]:
@@ -790,8 +827,10 @@ def _list_codex_plugin_hooks(cwd: Path) -> tuple[bool, list[dict[str, object]], 
     proc = popen
     try:
         deadline = time.monotonic() + _CODEX_CLI_TIMEOUT_SECONDS
+        lines = _codex_stdout_lines(proc)
         _codex_app_server_request(
             proc,
+            lines,
             1,
             "initialize",
             {
@@ -810,6 +849,7 @@ def _list_codex_plugin_hooks(cwd: Path) -> tuple[bool, list[dict[str, object]], 
         proc.stdin.flush()
         response = _codex_app_server_request(
             proc,
+            lines,
             2,
             "hooks/list",
             {"cwds": [str(cwd)]},
@@ -1223,9 +1263,9 @@ def _strip_jsonc(text: str) -> str:
 
 def _read_jsonc_object(path: Path) -> dict[str, object]:
     try:
-        text = path.read_text() if path.exists() else "{}"
+        text = path.read_text(encoding="utf-8") if path.exists() else "{}"
         parsed = json.loads(_strip_jsonc(text or "{}"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"could not parse OpenCode config {path}: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ValueError(f"OpenCode config {path} must be a JSON object")
@@ -1238,25 +1278,20 @@ def _opencode_global_config_dir() -> Path:
     return base / "opencode"
 
 
-def _opencode_config_path(
+def _opencode_scope_config_paths(
     *, global_config: bool = False, cwd: Path | None = None
-) -> Path:
-    if global_config:
-        config_dir = _opencode_global_config_dir()
-        for name in _OPENCODE_CONFIG_NAMES:
-            candidate = config_dir / name
-            if candidate.exists():
-                return candidate
-        return config_dir / "opencode.json"
+) -> list[Path]:
+    """Every config file OpenCode reads for the selected scope, existing or not.
+
+    OpenCode merges all of them rather than picking one, so a claude-smart
+    entry in any of them is loaded. Mirrors the Node installer's
+    ``opencodeScopeConfigPaths``.
+    """
     base = cwd or Path.cwd()
-    candidates = [
-        *(base / name for name in _OPENCODE_CONFIG_NAMES),
-        *(base / ".opencode" / name for name in _OPENCODE_CONFIG_NAMES),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return base / "opencode.json"
+    roots = (
+        [_opencode_global_config_dir()] if global_config else [base, base / ".opencode"]
+    )
+    return [root / name for root in roots for name in _OPENCODE_CONFIG_NAMES]
 
 
 def _opencode_plugin_spec(entry: object) -> str | None:
@@ -1264,6 +1299,11 @@ def _opencode_plugin_spec(entry: object) -> str | None:
         return entry
     if isinstance(entry, list) and entry and isinstance(entry[0], str):
         return entry[0]
+    # OpenCode also accepts the object form, { package, options }.
+    if isinstance(entry, dict):
+        package = entry.get("package")
+        if isinstance(package, str):
+            return package
     return None
 
 
@@ -1306,11 +1346,7 @@ def _is_opencode_claude_smart_spec(spec: str | None) -> bool:
     return False
 
 
-def _patch_opencode_plugin_config(
-    config_path: Path, *, install: bool, plugin_spec: str | None = None
-) -> tuple[bool, Path]:
-    if install and plugin_spec is None:
-        plugin_spec = _opencode_local_plugin_spec()
+def _read_opencode_plugin_config(config_path: Path) -> dict[str, object]:
     data = _read_jsonc_object(config_path)
     for field in ("plugins", "plugin"):
         value = data.get(field)
@@ -1318,6 +1354,15 @@ def _patch_opencode_plugin_config(
             raise ValueError(
                 f'OpenCode config {config_path} field "{field}" must be a JSON array'
             )
+    return data
+
+
+def _patch_opencode_plugin_config(
+    config_path: Path, *, install: bool, plugin_spec: str | None = None
+) -> tuple[bool, Path]:
+    if install and plugin_spec is None:
+        plugin_spec = _opencode_local_plugin_spec()
+    data = _read_opencode_plugin_config(config_path)
     current_plugin = data.get("plugin")
     plugins: list[object] = []
     if isinstance(current_plugin, list):
@@ -1342,14 +1387,170 @@ def _patch_opencode_plugin_config(
     if not changed:
         return False, config_path
     if config_path.exists():
-        original = config_path.read_text()
+        original = config_path.read_text(encoding="utf-8")
         if original.strip() and original != _strip_jsonc(original):
-            config_path.with_suffix(config_path.suffix + ".bak").write_text(original)
+            config_path.with_suffix(config_path.suffix + ".bak").write_text(
+                original, encoding="utf-8"
+            )
     data["plugin"] = next_plugins
     data.pop("plugins", None)
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return True, config_path
+
+
+def _remove_opencode_legacy_entries(
+    *, global_config: bool = False, cwd: Path | None = None
+) -> list[Path]:
+    """Remove claude-smart entries from every config the scope loads.
+
+    Every existing config is validated before any is rewritten, so a malformed
+    one fails the command without a partial edit.
+
+    Returns:
+        list[Path]: The configs that were rewritten.
+    """
+    existing = [
+        path
+        for path in _opencode_scope_config_paths(global_config=global_config, cwd=cwd)
+        if path.exists()
+    ]
+    for path in existing:
+        _read_opencode_plugin_config(path)
+    return [
+        path for path in existing if _patch_opencode_plugin_config(path, install=False)[0]
+    ]
+
+
+# Plugins-directory loader, mirroring the Node installer byte-for-byte: each
+# side must recognize (and refresh or remove) what the other wrote.
+_OPENCODE_V2_PLUGIN_MARKER = "claude-smart OpenCode V2 loader"
+_OPENCODE_V2_LOADER_COMMENT = (
+    "// OpenCode V2 auto-loads this directory. Reinstall claude-smart to refresh."
+)
+
+
+def _opencode_v2_plugin_file(
+    *, global_config: bool = False, cwd: Path | None = None
+) -> Path:
+    if global_config:
+        return _opencode_global_config_dir() / "plugins" / "claude-smart.js"
+    return (cwd or Path.cwd()) / ".opencode" / "plugins" / "claude-smart.js"
+
+
+def _opencode_v2_plugin_body(
+    package_root: Path = _OPENCODE_LOCAL_PACKAGE_DIR,
+) -> str:
+    root = package_root if package_root.is_absolute() else package_root.resolve(strict=False)
+    entry = (root / "plugin" / "opencode" / "dist" / "server.mjs").as_uri()
+    return "\n".join(
+        [
+            f"// {_OPENCODE_V2_PLUGIN_MARKER}",
+            _OPENCODE_V2_LOADER_COMMENT,
+            f"export {{ default }} from {json.dumps(entry)};",
+            "",
+        ]
+    )
+
+
+def _is_generated_opencode_v2_loader(text: str) -> bool:
+    lines = text.split("\n")
+    if len(lines) != 4 or lines[3] != "":
+        return False
+    if lines[0] != f"// {_OPENCODE_V2_PLUGIN_MARKER}":
+        return False
+    if lines[1] != _OPENCODE_V2_LOADER_COMMENT:
+        return False
+    return re.match(r'^export \{ default \} from "file://.+";$', lines[2]) is not None
+
+
+def _read_opencode_v2_loader(target: Path) -> str | None:
+    """Read the loader path; ``None`` only when nothing is there.
+
+    A directory or unreadable file raises ``OSError`` so callers treat it as
+    occupied. Undecodable bytes are replaced, so a foreign file is read (and
+    never equals the generated body) instead of crashing the installer.
+    """
+    try:
+        return target.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+
+
+def _opencode_v2_loader_conflicts(
+    *, global_config: bool = False
+) -> tuple[Path, str] | None:
+    """Return the loader path and why it is blocked; checked before any config change."""
+    target = _opencode_v2_plugin_file(global_config=global_config)
+    try:
+        existing = _read_opencode_v2_loader(target)
+    except OSError as exc:
+        return target, f"It cannot be read as a file ({exc.strerror or exc})"
+    if existing is not None and not _is_generated_opencode_v2_loader(existing):
+        return target, "It is not a claude-smart loader"
+    return None
+
+
+def _write_opencode_v2_plugin(
+    package_root: Path, *, global_config: bool = False, cwd: Path | None = None
+) -> tuple[Path, str]:
+    target = _opencode_v2_plugin_file(global_config=global_config, cwd=cwd)
+    body = _opencode_v2_plugin_body(package_root)
+    try:
+        existing = _read_opencode_v2_loader(target)
+    except OSError:
+        return target, "conflict"
+    if (
+        existing is not None
+        and existing != body
+        and not _is_generated_opencode_v2_loader(existing)
+    ):
+        return target, "conflict"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if existing != body:
+        # newline="": the bytes must match the Node installer's on Windows too.
+        target.write_text(body, encoding="utf-8", newline="")
+    return target, "unchanged" if existing == body else "wrote"
+
+
+def _remove_opencode_v2_plugin(
+    *, global_config: bool = False, cwd: Path | None = None
+) -> bool:
+    target = _opencode_v2_plugin_file(global_config=global_config, cwd=cwd)
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not _is_generated_opencode_v2_loader(text):
+        return False
+    target.unlink()
+    return True
+
+
+def _config_lists_claude_smart(config_path: Path) -> bool:
+    try:
+        data = _read_jsonc_object(config_path)
+    except ValueError:
+        return False
+    for key in ("plugin", "plugins"):
+        items = data.get(key)
+        if isinstance(items, list) and any(
+            _is_opencode_claude_smart_spec(_opencode_plugin_spec(item))
+            for item in items
+        ):
+            return True
+    return False
+
+
+def _scope_has_claude_smart(
+    *, global_config: bool = False, cwd: Path | None = None
+) -> bool:
+    if _opencode_v2_plugin_file(global_config=global_config, cwd=cwd).exists():
+        return True
+    return any(
+        _config_lists_claude_smart(path)
+        for path in _opencode_scope_config_paths(global_config=global_config, cwd=cwd)
+    )
 
 
 def _has_extraction_provider() -> bool:
@@ -1573,22 +1774,44 @@ def cmd_install_opencode(args: argparse.Namespace) -> int:
         return 1
     package_root = Path(package_root_text)
     plugin_root = package_root / "plugin"
-    plugin_spec = _opencode_local_plugin_spec(package_root)
-    config_path = _opencode_config_path(
-        global_config=bool(getattr(args, "global_config", False))
-    )
-    try:
-        changed, config_path = _patch_opencode_plugin_config(
-            config_path,
-            install=True,
-            plugin_spec=plugin_spec,
+    global_config = bool(getattr(args, "global_config", False))
+    conflict = _opencode_v2_loader_conflicts(global_config=global_config)
+    if conflict is not None:
+        # The loader is the only load path, so on a conflict nothing loads
+        # claude-smart: fail loudly, before the config is touched.
+        conflict_path, reason = conflict
+        sys.stderr.write(
+            f"error: left an existing OpenCode plugin in place at {conflict_path}. "
+            f"{reason}; move it aside and reinstall to write the loader. "
+            "claude-smart OpenCode support is not installed.\n"
         )
+        return 1
+    try:
+        # One load path per scope, matching the Node installer: both OpenCode
+        # lines load the plugins-directory loader (1.x auto-loads
+        # {plugin,plugins}/*.{ts,js} from its config directories; V2 rejects
+        # the old file:// config-entry shape). A config entry beside the
+        # loader is a second load spec — 1.x runs server() twice and V2 lists
+        # the duplicate as a failed "Duplicate plugin ID" — so install removes
+        # any legacy entry, from every config the scope loads, instead of
+        # writing one.
+        changed_paths = _remove_opencode_legacy_entries(global_config=global_config)
     except ValueError as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 1
-    action = "Updated" if changed else "OpenCode config already includes"
+    loader_path, loader_status = _write_opencode_v2_plugin(
+        package_root, global_config=global_config
+    )
+    for config_path in changed_paths:
+        sys.stdout.write(
+            f"Removed the legacy claude-smart plugin entry from {config_path}; "
+            "the loader replaces it.\n"
+        )
     sys.stdout.write(
-        f"{action} `{plugin_spec}` in {config_path}.\n"
+        f"Wrote the OpenCode loader at {loader_path}; OpenCode 1.x and V2 "
+        "both load the plugin from there.\n"
+    )
+    sys.stdout.write(
         f"Prepared claude-smart runtime at {plugin_root}.\n"
         "Restart OpenCode in your project so it loads the plugin.\n"
     )
@@ -1935,25 +2158,34 @@ def cmd_uninstall_opencode(args: argparse.Namespace) -> int:
     ):
         if script.exists():
             _run_service(script, "stop")
-    config_path = _opencode_config_path(
-        global_config=bool(getattr(args, "global_config", False))
-    )
+    global_config = bool(getattr(args, "global_config", False))
     try:
-        changed, config_path = _patch_opencode_plugin_config(config_path, install=False)
+        changed_paths = _remove_opencode_legacy_entries(global_config=global_config)
     except ValueError as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 1
-    shutil.rmtree(_OPENCODE_LOCAL_PACKAGE_DIR, ignore_errors=True)
-    _repair_plugin_root(_HOST_OPENCODE)
-    try:
-        _OPENCODE_LOCAL_PACKAGE_DIR.parent.rmdir()
-    except OSError:
-        pass
-    if changed:
+    # The selected scope only: a --global install is a separate installation
+    # and its loader must survive a project-scoped uninstall. The loader must
+    # not stay behind either — it re-exports the shared package, so leaving it
+    # would break every later OpenCode start that imports the missing target.
+    _remove_opencode_v2_plugin(global_config=global_config)
+    # Both scopes share one package copy and every loader re-exports its
+    # server.mjs, so keep it while the other scope still references it — the
+    # same check the Node installer runs.
+    # shortcut: loaders in other projects are not enumerable, so a --global
+    # uninstall can still strand them; upgrade when installs are tracked machine-wide.
+    if not _scope_has_claude_smart(global_config=not global_config):
+        shutil.rmtree(_OPENCODE_LOCAL_PACKAGE_DIR, ignore_errors=True)
+        _repair_plugin_root(_HOST_OPENCODE)
+        try:
+            _OPENCODE_LOCAL_PACKAGE_DIR.parent.rmdir()
+        except OSError:
+            pass
+    for config_path in changed_paths:
         sys.stdout.write(
             f"Removed claude-smart OpenCode plugin entries from {config_path}.\n"
         )
-    else:
+    if not changed_paths:
         sys.stdout.write("OpenCode config did not include claude-smart.\n")
     sys.stdout.write(f"Restart OpenCode to apply. {_LOCAL_DATA_NOTICE}")
     return 0
@@ -2013,6 +2245,78 @@ def _reflexio_show_footer() -> str:
         f"\n---\nclaude-smart is powered by [reflexio]({cs_cite.REFLEXIO_REPO_URL})"
         f" — if it helps you, [star it on GitHub]({cs_cite.REFLEXIO_REPO_URL}).\n"
     )
+
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def cmd_load(args: argparse.Namespace) -> int:
+    """Print the full text of one injected ``[cs:ID]`` item.
+
+    Reads the session's citation registry, which already holds each shown
+    item's content, trigger and rationale, so loading needs no backend call
+    and works offline, in managed mode, and after the item is edited
+    server-side (it prints what was retrieved for this session).
+
+    Args:
+        args (argparse.Namespace): ``args.id`` is the item id, with or
+            without the ``cs:`` prefix or brackets; ``args.session`` overrides
+            the session (defaults to the most recently injected one).
+
+    Returns:
+        int: 0 when the item was printed, 1 for an unknown id or session.
+    """
+    item_id = args.id.strip().strip("[]").removeprefix("cs:")
+    session_id = (
+        args.session if args.session is not None else _latest_injected_session_id()
+    )
+    if session_id is not None and not _SESSION_ID_RE.match(session_id):
+        sys.stderr.write(f"error: invalid session id {session_id!r}\n")
+        return 1
+    if not session_id:
+        sys.stderr.write(
+            "error: no claude-smart session has injected learnings yet; "
+            "pass --session <id> from the injected load command.\n"
+        )
+        return 1
+    entry = state.read_injected(session_id).get(item_id)
+    if entry is None:
+        sys.stderr.write(
+            f"error: unknown id {item_id!r} in session {session_id}. Use an id "
+            "from a [cs:…] line injected in this session.\n"
+        )
+        return 1
+    sys.stdout.write(context_format.render_loaded_item(entry))
+    # The open turn that injected this learning reports it as ``loaded`` when
+    # both land in one publish batch; any other load stays local. Recording
+    # is best effort: the agent already has the text it asked for.
+    try:
+        sent = state.append_loaded(session_id, entry)
+        if sent is not None:
+            hook_log.log_event(
+                event="load",
+                host=runtime.host(),
+                session_id=session_id,
+                extra={
+                    "load_sent": sent,
+                    "local_only_loads": state.local_only_load_count(session_id),
+                },
+            )
+    except Exception as exc:  # noqa: BLE001 — never fail a successful load.
+        _LOGGER.debug("could not record load of %s: %s", item_id, exc)
+    return 0
+
+
+def _latest_injected_session_id() -> str | None:
+    """Session whose citation registry was written most recently."""
+    root = state.state_dir()
+    if not root.is_dir():
+        return None
+    suffix = ".injected.jsonl"
+    files = sorted(
+        root.glob(f"*{suffix}"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    return files[0].name[: -len(suffix)] if files else None
 
 
 def cmd_learn(args: argparse.Namespace) -> int:
@@ -2091,6 +2395,16 @@ def cmd_learn(args: argparse.Namespace) -> int:
     if status == "nothing":
         sys.stdout.write(f"No unpublished interactions on session `{session_id}`.\n")
         return 0
+    if status == "parked":
+        sys.stdout.write(
+            f"Reflexio repeatedly rejected a buffered batch on session `{session_id}`; "
+            "it was skipped so later interactions can publish.\n"
+            "Its `publish_dead_letter` record in the session buffer keeps the "
+            "request ID, range and reason. The local interactions remain there; "
+            "retrying will not resend that range. "
+            "See `publish-parked` in ~/.claude-smart/hook.log.\n"
+        )
+        return 1
     sys.stdout.write(_REFLEXIO_UNREACHABLE_MSG)
     return 1
 
@@ -2790,6 +3104,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     ln.set_defaults(func=cmd_learn)
+
+    ld = sub.add_parser(
+        "load",
+        help="Print the full text of an injected [cs:ID] learning",
+    )
+    ld.add_argument("id", help="Injected item id, e.g. s1-ab12")
+    ld.add_argument(
+        "--session", help="Session id (defaults to the latest injected session)"
+    )
+    ld.set_defaults(func=cmd_load)
 
     ca = sub.add_parser(
         "clear-all",

@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
   </a>
   <a href="plugin/pyproject.toml">
-    <img src="https://img.shields.io/badge/version-0.3.13-green.svg" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.3.17-green.svg" alt="Version">
   </a>
   <a href="plugin/pyproject.toml">
     <img src="https://img.shields.io/badge/python-%3E%3D3.12-brightgreen.svg" alt="Python">
@@ -148,7 +148,7 @@ to resume learning. The interactive guide offers both modes for either backend.
 
 Run `/reload-plugins` in your existing Claude Code session, or use the update in your next session.
 Start a new Codex session to load the update; you can finish your existing session first. If hook trust needs review, use `/hooks`.
-Then restart OpenCode in your project so it loads the plugin from `opencode.json`. Add `--global` to install for all OpenCode projects on this machine instead.
+Then restart OpenCode in your project so it loads the plugin. The installer writes a loader into the selected scope's `plugins` directory — the project's `.opencode/plugins/` for a project install — and both OpenCode lines load the plugin from there: OpenCode 1.x auto-loads the plugins directory, and OpenCode V2 rejects the old `file://` config-entry shape. Any legacy `opencode.json` entry is removed so the package loads exactly once. `--global` installs for all OpenCode projects on this machine instead, writing the loader under your user config directory.
 
 ### Check an update
 
@@ -157,7 +157,7 @@ npx claude-smart status
 npx claude-smart status --host codex
 ```
 
-Shows the installed version and the version each recent session last used in a hook. Historical observations do not confirm that a session is still active. Codex uses `CODEX_HOME` when set; run installation and status with the same account home as your session.
+Shows the installed version and the version each recent session last used in a hook. Historical observations do not confirm that a session is still active. Codex uses `CODEX_HOME` when set; run installation and status with the same account home as your session. `status --host codex` also warns when a claude-smart hook is disabled in Codex's `config.toml` and says how to re-enable it; it never edits that file.
 
 ### Uninstall
 
@@ -249,7 +249,7 @@ claude-smart builds three artifacts as you work and injects the relevant ones in
 
 Skills clean themselves up: correct the same thing twice and they merge; change your mind and the old one is archived.
 
-Under the hood: hooks watch your turns, tool calls, and assistant replies, auto-flagging corrections (or anything you flag with `/claude-smart:learn`). At session end (or on `/claude-smart:learn`), [reflexio](https://github.com/ReflexioAI/reflexio) — the self-improving engine that powers claude-smart — extracts preferences and project-specific skills, then rolls durable patterns into shared skills. On each new user prompt, claude-smart searches for matching context and injects only the relevant hits. Run `/claude-smart:show` or the equivalent CLI command to audit the current learned state. Everything runs on your machine.
+Under the hood: hooks watch your turns, tool calls, and assistant replies, auto-flagging corrections (or anything you flag with `/claude-smart:learn`). At session end (or on `/claude-smart:learn`), [reflexio](https://github.com/ReflexioAI/reflexio) — the self-improving engine that powers claude-smart — extracts preferences and project-specific skills, then rolls durable patterns into shared skills. On each new user prompt, claude-smart searches for matching context and injects only the relevant hits, as a short index: one line per hit saying when it applies. The agent loads the full text of any hit that applies with `bash ~/.reflexio/plugin-root/scripts/cli.sh load --session <session-id> <id>` (the injected header gives the exact command). Run `/claude-smart:show` or the equivalent CLI command to audit the current learned state. Everything runs on your machine.
 
 **Citations.** At the end of a reply, the assistant may append a short marker:
 
@@ -290,17 +290,23 @@ Advanced users can tune claude-smart via environment variables — see [DEVELOPE
 | Path | What |
 | --- | --- |
 | `~/.reflexio/data/reflexio.db` | Source of truth for learned preferences, skills, interactions, full-text indexes, and embedding tables (plus `.db-shm` / `.db-wal` WAL sidecars). Inspect with `sqlite3`. |
-| `~/.claude-smart/.env` | claude-smart config read by the hooks, backend, installer, and `npx claude-smart setup` — `CLAUDE_SMART_HOST`, `CLAUDE_SMART_USE_LOCAL_CLI`, `CLAUDE_SMART_USE_LOCAL_EMBEDDING`, `CLAUDE_SMART_OPENCODE_PATH`, and in managed mode `REFLEXIO_URL` / `REFLEXIO_API_KEY`. |
+| `~/.claude-smart/.env` | claude-smart config read by the hooks, backend, installer, and `npx claude-smart setup` — `CLAUDE_SMART_HOST`, `CLAUDE_SMART_USE_LOCAL_CLI`, `CLAUDE_SMART_OPENCODE_PATH`, and in managed mode `REFLEXIO_URL` / `REFLEXIO_API_KEY`. |
 | `~/.claude-smart/claude-code/claude-smart/` | Claude Code's stable local copy of the active npm package, registered as the `reflexioai` marketplace. Claude Code runs the plugin in place from its `plugin/` dir. |
-| `.claude/settings.local.json` or `~/.claude/settings.json` | Claude Code hook environment, such as `CLAUDE_SMART_ENABLE_OPTIMIZER`; use project-local settings for one repo or user settings for all projects. |
+| `.claude/settings.local.json` or `~/.claude/settings.json` | Claude Code hook environment, such as `CLAUDE_SMART_CITATIONS`; use project-local settings for one repo or user settings for all projects. |
 | `~/.codex/config.toml` | Codex plugin state, hook feature flags, and per-hook trust entries after `claude-smart install --host codex`. |
 | `~/.codex/plugins/cache/reflexioai/claude-smart/<version>/` | Codex's cached install of the `claude-smart` plugin from the `ReflexioAI` marketplace. |
+| `~/.codex/claude-smart/runtime/plugin/` | Codex's prepared Python environment and dashboard. Hooks in the cache execute this runtime; generated dependencies stay outside the validated plugin package. Both Codex paths use `CODEX_HOME` when set. |
 | `opencode.json` / `opencode.jsonc`, or existing `.opencode/opencode.json*` | OpenCode local plugin config patched by `claude-smart install --host opencode`; the installer updates only the claude-smart entry in OpenCode's plugin list. |
 | `~/.claude-smart/opencode/claude-smart/` | OpenCode's stable local copy of the active npm package. OpenCode config points here with `file://` so restarts do not re-resolve `claude-smart` from npm. |
 | `~/.reflexio/plugin-root` | Self-healed symlink to the active plugin dir (managed by `ensure-plugin-root.sh` — written on install, refreshed each `SessionStart`). Claude Code slash commands and Codex shell-command helpers resolve through it, so don't delete it; if you do, the next session will recreate it. |
-| `~/.claude-smart/sessions/{session_id}.jsonl` | Per-session buffer. User turns, assistant turns, tool invocations, `{"published_up_to": N}` watermarks. Safe to inspect and safe to delete — everything past the latest watermark has already been written to reflexio's DB. |
+| `~/.claude-smart/sessions/{session_id}.jsonl` | Private per-session buffer: turns, tools, frozen requests and publication watermarks. Unacknowledged data remains here; deleting the buffer can lose pending interactions. |
+| `~/.claude-smart/publish-outbox/` | Private Codex publication intents and shared worker locks. Contains destination fingerprints and completed-turn bounds; interaction content stays in session buffers. |
 | `~/.claude-smart/node/current/` | Private Node.js/npm runtime used by hooks and the dashboard after install. |
 | `~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/` | Cached ONNX weights (~86 MB, downloaded once). Delete to force a re-download. |
+
+Upgrading from `CLAUDE_SMART_USE_LOCAL_EMBEDDING` requires removing the retired
+assignment after preserving the effective model, endpoint and timeout policy.
+See the [embedding upgrade guide](https://github.com/ReflexioAI/claude-smart/blob/main/DEVELOPER.md#upgrade-from-the-old-embedding-flag), including the case where an old local default shadowed a written `off`.
 
 For troubleshooting, see [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
 
@@ -353,6 +359,26 @@ publication in the same session. The operator can configure
 publications). This fallback is a low-urgency policy, not proof a session ended.
 Normal full-window and stride extraction still runs promptly. A negative judge
 result produces no learning and is recorded as examined.
+
+Optimizer policy is also owned by the Reflexio server. SessionStart no longer
+turns optimization on or rewrites its budgets, adoption permissions or assistant
+backend. Existing server settings are preserved; fresh servers keep their own
+(disabled) optimizer default until explicitly configured. The old
+`CLAUDE_SMART_ENABLE_OPTIMIZER` hook flag is no longer read. Removing or setting
+that flag does not disable an optimizer already enabled on the server; change
+`playbook_optimizer_config` on the server to do that.
+
+The separately installed `claude-smart-optimizer-assistant` helper remains
+available for explicitly configured local optimization. See the
+[backend binding notes](./DEVELOPER.md#optimizer-backend-binding) before assigning
+an executable path, especially when the server is remote.
+
+Extraction cadence is owned by the Reflexio server: configure `window_size` and
+`stride_size` there. Starting a client session preserves those settings. The
+former hook overrides `CLAUDE_SMART_WINDOW_SIZE` and `CLAUDE_SMART_STRIDE_SIZE`
+are no longer read; remove them from launchers and set the server configuration
+explicitly when a benchmark needs a different cadence. Existing persisted values
+are preserved; fresh servers use their own defaults.
 
 Managed mode requires a server update; changing the plugin alone cannot update a
 cloud server. An older server retains saved messages and logs that completion is

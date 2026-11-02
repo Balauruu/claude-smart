@@ -122,23 +122,11 @@ export interface ClaudeSmartConfig {
   REFLEXIO_API_KEY: string;
   REFLEXIO_API_KEY_SET?: boolean;
   CLAUDE_SMART_USE_LOCAL_CLI: boolean;
-  CLAUDE_SMART_USE_LOCAL_EMBEDDING: boolean;
   CLAUDE_SMART_READ_ONLY: boolean;
   CLAUDE_SMART_CLI_PATH: string;
   CLAUDE_SMART_CLI_TIMEOUT: string;
   CLAUDE_SMART_STATE_DIR: string;
   [extra: string]: string | boolean | undefined;
-}
-
-export type OptimizerMode = "auto" | "enabled" | "disabled";
-
-export interface ClaudeCodeHookConfig {
-  CLAUDE_SMART_ENABLE_OPTIMIZER: OptimizerMode;
-  effectiveValue: OptimizerMode;
-  localValue: OptimizerMode | null;
-  userValue: OptimizerMode | null;
-  settingsPath: string;
-  userSettingsPath: string;
 }
 
 export interface ReflexioExtractorConfig {
@@ -147,11 +135,10 @@ export interface ReflexioExtractorConfig {
 }
 
 export interface ReflexioRetrievalFloorConfig {
-  enabled?: boolean;
-  pool_size?: number;
-  profile_floor?: number;
-  user_playbook_floor?: number;
-  agent_playbook_floor?: number;
+  candidate_pool_size?: number;
+  profile_floor?: number | null;
+  user_playbook_floor?: number | null;
+  agent_playbook_floor?: number | null;
   [k: string]: unknown;
 }
 
@@ -164,8 +151,8 @@ export interface ReflexioConfig {
   window_size?: number;
   stride_size?: number;
   retrieval_floor?: ReflexioRetrievalFloorConfig | null;
-  profile_extractor_configs?: ReflexioExtractorConfig[] | null;
-  user_playbook_extractor_configs?: ReflexioExtractorConfig[] | null;
+  profile_extractor_config?: ReflexioExtractorConfig | null;
+  user_playbook_extractor_config?: ReflexioExtractorConfig | null;
   [k: string]: unknown;
 }
 

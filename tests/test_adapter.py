@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sys
 import threading
@@ -831,156 +832,6 @@ def test_fetch_agent_playbooks_filters_rejected_locally() -> None:
 
 
 # -----------------------------------------------------------------------------
-# apply_extraction_defaults — push claude-smart's preferred cadence to reflexio
-# -----------------------------------------------------------------------------
-
-
-class _ConfigClient:
-    """Captures get_config/set_config calls against a mutable config object."""
-
-    def __init__(self, *, window_size: int, stride_size: int, get_raises=None):
-        self._config = SimpleNamespace(window_size=window_size, stride_size=stride_size)
-        self._get_raises = get_raises
-        self.set_calls: list[SimpleNamespace] = []
-
-    def get_config(self):
-        if self._get_raises is not None:
-            raise self._get_raises
-        return self._config
-
-    def set_config(self, config):
-        self.set_calls.append(
-            SimpleNamespace(
-                window_size=config.window_size, stride_size=config.stride_size
-            )
-        )
-        self._config = config
-        return {"ok": True}
-
-
-def test_apply_extraction_defaults_writes_when_values_differ() -> None:
-    client = _ConfigClient(window_size=10, stride_size=5)
-    a = _adapter_with(client)
-    assert a.apply_extraction_defaults(window_size=5, stride_size=3) is True
-    assert len(client.set_calls) == 1
-    assert client.set_calls[0].window_size == 5
-    assert client.set_calls[0].stride_size == 3
-
-
-def test_apply_extraction_defaults_skips_set_when_values_match() -> None:
-    client = _ConfigClient(window_size=5, stride_size=3)
-    a = _adapter_with(client)
-    assert a.apply_extraction_defaults(window_size=5, stride_size=3) is True
-    assert client.set_calls == []
-
-
-def test_apply_extraction_defaults_returns_false_when_client_unavailable(
-    monkeypatch,
-) -> None:
-    a = reflexio_adapter.Adapter()
-    monkeypatch.setattr(a, "_get_client", lambda: None)
-    assert a.apply_extraction_defaults(window_size=5, stride_size=3) is False
-
-
-def test_apply_extraction_defaults_absorbs_get_config_errors() -> None:
-    a = _adapter_with(
-        _ConfigClient(window_size=10, stride_size=5, get_raises=RuntimeError("down"))
-    )
-    assert a.apply_extraction_defaults(window_size=5, stride_size=3) is False
-
-
-# -----------------------------------------------------------------------------
-# apply_optimizer_defaults — opt-in Reflexio optimizer wiring
-# -----------------------------------------------------------------------------
-
-
-class _OptimizerConfigClient:
-    def __init__(self, *, opt=None, get_raises=None):
-        self._config = SimpleNamespace(
-            playbook_optimizer_config=opt
-            or SimpleNamespace(
-                enabled=False,
-                optimize_user_playbooks=False,
-                optimize_agent_playbooks=True,
-                auto_update_user_playbooks=False,
-                min_commit_windows=2,
-                assistant_script_path=None,
-                assistant_script_args=["old"],
-                webhook_url="https://example.test/assistant",
-                webhook_timeout_seconds=60,
-            )
-        )
-        self._get_raises = get_raises
-        self.set_calls: list[Any] = []
-
-    def get_config(self):
-        if self._get_raises is not None:
-            raise self._get_raises
-        return self._config
-
-    def set_config(self, config):
-        self.set_calls.append(config)
-        self._config = config
-        return {"ok": True}
-
-
-def test_apply_optimizer_defaults_writes_required_fields() -> None:
-    client = _OptimizerConfigClient()
-    a = _adapter_with(client)
-
-    assert a.apply_optimizer_defaults(script_path="/venv/bin/assistant") is True
-
-    assert len(client.set_calls) == 1
-    opt = client.set_calls[0].playbook_optimizer_config
-    assert opt.enabled is True
-    assert opt.optimize_user_playbooks is False
-    assert opt.optimize_agent_playbooks is True
-    assert opt.auto_update_user_playbooks is True
-    assert opt.min_commit_windows == 1
-    assert opt.max_metric_calls == 15
-    assert opt.assistant_script_path == "/venv/bin/assistant"
-    assert opt.assistant_script_args == []
-    assert opt.webhook_url is None
-    assert opt.webhook_timeout_seconds == 300
-
-
-def test_apply_optimizer_defaults_skips_set_when_values_match() -> None:
-    opt = SimpleNamespace(
-        enabled=True,
-        optimize_user_playbooks=False,
-        optimize_agent_playbooks=True,
-        auto_update_user_playbooks=True,
-        min_commit_windows=1,
-        max_metric_calls=15,
-        assistant_script_path="/venv/bin/assistant",
-        assistant_script_args=[],
-        webhook_url=None,
-        webhook_timeout_seconds=300,
-    )
-    client = _OptimizerConfigClient(opt=opt)
-    a = _adapter_with(client)
-
-    assert a.apply_optimizer_defaults(script_path="/venv/bin/assistant") is True
-
-    assert client.set_calls == []
-
-
-def test_apply_optimizer_defaults_returns_false_when_client_unavailable(
-    monkeypatch,
-) -> None:
-    a = reflexio_adapter.Adapter()
-    monkeypatch.setattr(a, "_get_client", lambda: None)
-
-    assert a.apply_optimizer_defaults(script_path="/venv/bin/assistant") is False
-
-
-def test_apply_optimizer_defaults_absorbs_get_config_errors() -> None:
-    a = _adapter_with(_OptimizerConfigClient(get_raises=RuntimeError("down")))
-
-    assert a.apply_optimizer_defaults(script_path="/venv/bin/assistant") is False
-
-
-# -----------------------------------------------------------------------------
 # fetch_stall_state / mark_stall_notified
 # -----------------------------------------------------------------------------
 
@@ -1795,3 +1646,163 @@ def test_finalize_acceptance_does_not_publish(monkeypatch):
     monkeypatch.setattr(adapter, "_get_client", lambda: client)
     assert adapter.finalize_session(session_id="s", project_id="u")
     client.publish_interaction.assert_not_called()
+
+
+class _RejectingRawClient:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+
+    def _make_request(self, method, path, **kwargs):
+        if path == "/api/get_requests":
+            return {"success": True, "sessions": []}
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+class _HttpErrorResponse:
+    status_code = 402
+
+    def json(self):
+        return {"detail": "Spending cap reached; token=sk-live-secret"}
+
+
+class _HttpError(Exception):
+    response = _HttpErrorResponse()
+
+
+@pytest.mark.parametrize("shape", ["rejection", "http"])
+def test_failed_publish_logs_request_id_and_sanitized_server_message(
+    tmp_path, monkeypatch, shape
+):
+    import json
+
+    from claude_smart import hook_log
+
+    path = tmp_path / "hook.log"
+    monkeypatch.setattr(hook_log, "_LOG_PATH", path)
+    message = (
+        "1 validation error: Value error [type=value_error, "
+        "input_value='secret-payload text', input_type=str] "
+        "Authorization: Bearer secret-token "
+        "postgresql://db-user:db-password@db.internal/reflexio " + "x" * 400
+    )
+    client = (
+        _RejectingRawClient(response={"success": False, "message": message})
+        if shape == "rejection"
+        else _RejectingRawClient(error=_HttpError("402 Payment Required"))
+    )
+    result = _adapter_with(client).publish(
+        session_id="session",
+        project_id="project",
+        request_id="request-1",
+        interactions=[{"role": "User", "content": "secret-payload text"}],
+    )
+    assert not result
+    record = json.loads(path.read_text())
+    assert record["publish_status"] == "failed"
+    assert record["request_id"] == "request-1"
+    logged = record["server_message"]
+    assert logged and len(logged) <= 200
+    if shape == "rejection":
+        assert record["error_type"] == "ServerRejected"
+        assert logged.startswith("1 validation error")
+    else:
+        assert record["http_status"] == 402
+        assert logged.startswith("Spending cap reached")
+    data = path.read_text()
+    for secret in (
+        "secret-payload",
+        "secret-token",
+        "db-password",
+        "db-user",
+        "sk-live-secret",
+    ):
+        assert secret not in data
+
+
+def _empty_unified() -> SimpleNamespace:
+    return SimpleNamespace(user_playbooks=[], agent_playbooks=[], profiles=[])
+
+
+def test_search_all_omits_optional_fields_by_default() -> None:
+    client = _RecordingClient(unified_resp=_empty_unified())
+
+    _adapter_with(client).search_all(project_id="p", query="q", session_id="s")
+
+    assert "threshold" not in client.search_kwargs
+    assert "reset_session_seen" not in client.search_kwargs
+
+
+def test_search_all_passes_configured_threshold() -> None:
+    client = _RecordingClient(unified_resp=_empty_unified())
+
+    _adapter_with(client).search_all(project_id="p", query="q", threshold=0.4)
+
+    assert client.search_kwargs["threshold"] == 0.4
+
+
+def test_search_all_sends_reset_when_client_accepts_it() -> None:
+    client = _RecordingClient(unified_resp=_empty_unified())
+
+    _adapter_with(client).search_all(
+        project_id="p", query="q", session_id="s", reset_session_seen=True
+    )
+
+    assert client.search_kwargs["reset_session_seen"] is True
+
+
+def test_search_all_never_sends_reset_without_session() -> None:
+    client = _RecordingClient(unified_resp=_empty_unified())
+
+    _adapter_with(client).search_all(project_id="p", query="q", reset_session_seen=True)
+
+    assert "reset_session_seen" not in client.search_kwargs
+
+
+def test_search_all_skips_reset_on_client_that_predates_it() -> None:
+    """Released clients validate search keywords locally; do not break search."""
+
+    class OldClient:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        def search(
+            self,
+            request=None,
+            *,
+            query=None,
+            top_k=None,
+            threshold=None,
+            agent_version=None,
+            user_id=None,
+            entity_types=None,
+            agent_playbook_status_filter=None,
+            enable_agent_answer=None,
+            search_mode=None,
+            request_id=None,
+            session_id=None,
+        ):
+            self.kwargs = {"query": query, "session_id": session_id}
+            return _empty_unified()
+
+    client = OldClient()
+    adapter = _adapter_with(client)
+
+    assert adapter.search_all(
+        project_id="p", query="q", session_id="s", reset_session_seen=True
+    ) == ([], [], [])
+    assert adapter.read_errors == []
+    assert client.kwargs == {"query": "q", "session_id": "s"}
+
+
+def test_installed_client_search_signature_is_probed_not_assumed() -> None:
+    """Pins the gate to the real SDK: it accepts the kwarg iff it declares it."""
+    from reflexio import ReflexioClient
+
+    client = ReflexioClient(url_endpoint="http://127.0.0.1:9")
+    declared = "reset_session_seen" in inspect.signature(client.search).parameters
+    assert reflexio_adapter._client_accepts(client.search, "reset_session_seen") is (
+        declared
+    )

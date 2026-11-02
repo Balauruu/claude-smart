@@ -52,16 +52,17 @@ Tunables read by the plugin at runtime. Most users don't need to touch these —
 | `CLAUDE_SMART_LOCAL_URL`, `CLAUDE_SMART_LOCAL_API_KEY` | unset (bundled loopback endpoint, no key) | Private saved local dashboard connection. The installer and Configure page retain the previous connection when changing runtime modes. These keys are not exposed to browser clients. |
 | `CLAUDE_SMART_MANAGED_URL`, `CLAUDE_SMART_MANAGED_API_KEY` | unset (managed view unavailable) | Private saved managed dashboard connection. Allows viewing managed data while the runtime remains local. Selecting a view does not rewrite runtime settings, start services, or send cloud credentials to the local endpoint. |
 | `CLAUDE_SMART_GUIDED_CONFIG` | unset (legacy setup) | Internal saved marker (`1`) written after confirming guided configuration. Preserves explicit local endpoints and sharing settings even when a custom executable or cloud provider replaces the named learning provider. |
-| `CLAUDE_SMART_USE_LOCAL_EMBEDDING` | `0` (installer sets `1`) | Route embeddings to the shared local embedding daemon on `localhost:8072`. Written to `~/.claude-smart/.env` by `claude-smart install`. |
-| `REFLEXIO_EMBEDDING_PROVIDER` | `local_service` when local embedding is enabled | Embedding provider mode: `cloud`, `local_service`, `internal_service`, `inprocess`, or `off`. |
+| `REFLEXIO_EMBEDDING_PROVIDER` | model-derived when unset | Embedding provider mode: `cloud`, `local_service`, `internal_service`, or `off`. |
 | `REFLEXIO_EMBEDDING_SERVICE_URL` | `http://127.0.0.1:$EMBEDDING_PORT` | OpenAI-compatible embedding endpoint used by `local_service` and `internal_service`. |
+| `REFLEXIO_ROW_LIMIT_INTERACTIONS` | `500` (local installer) | Existing SDK interaction-row cap, saved in `~/.claude-smart/.env`; `0` disables cap cleanup. Existing file and process overrides remain authoritative. |
 | `EMBEDDING_PORT` | `8072` | Local embedding daemon port. Shared by Claude Code and Codex on the same machine. |
 | `REFLEXIO_RERANK_ENABLED` | `false` (hard-set by `backend-service.sh`) | claude-smart disables Reflexio's shared-service cross-encoder completely, so the local inference process skips reranker model loading and prewarm. This is intentionally not user-overridable in the bundled backend. |
-| `CLAUDE_SMART_ENABLE_OPTIMIZER` | auto: local Reflexio only | Hook-side env var that controls shared skill optimization and rollups during `SessionStart`. Set to `1` to force optimizer defaults for hosted Reflexio, or `0` to disable everywhere. Set it in Claude Code settings, not `~/.reflexio/.env`. |
 | `CLAUDE_SMART_CITATIONS` | `on` | Controls the final `✨ claude-smart rule applied` marker instruction. `on` (default) injects a compact instruction asking the assistant to cite only memories that materially changed the answer. `off` skips injection of the citation instruction entirely and strips any stray marker line from the assistant text before publishing. Legacy values `auto` and `marker-only` are accepted as enabled aliases. Set in Claude Code settings (hook env), not `~/.reflexio/.env`. |
 | `CLAUDE_SMART_CITATION_LINK_STYLE` | `markdown` | Controls the visible links in the final `✨ claude-smart rule applied` marker. `markdown` asks the model to emit `[human title](dashboard URL)` links and is the Codex default because Codex renders markdown links in assistant messages. `osc8` asks it to emit terminal-native OSC 8 hyperlinks so the human title can be clickable without showing the URL; unsupported terminals should fall back to markdown links. |
 | `CLAUDE_SMART_DASHBOARD_URL` | `http://localhost:3001` | Base URL used in injected citation targets and the final `✨ claude-smart rule applied` marker links. Override only if the local dashboard is exposed on another host or port. Model-facing citation links use short `/rules/{citationId}` resolver URLs; canonical direct links remain `/skills/project/{id}`, `/skills/shared/{id}`, and `/preferences/project/{id}`. `/preferences/{id}` remains a compatibility alias. |
 | `CLAUDE_SMART_CLI_PATH` | `claude` on Claude Code; Codex compatibility wrapper or `codex` on Codex | Override the executable Reflexio calls for local generation. |
+| `CLAUDE_SMART_MAX_INJECTED_ITEMS` | `6` | Total results one UserPromptSubmit or PreToolUse search may return across its three collections. Enforced as a per-collection `top_k` of `cap // 3` (at least 1), so nothing the server marks as served is dropped. `0` removes the cap (`top_k` 5); empty or invalid values use the default. Hook env. |
+| `CLAUDE_SMART_SEARCH_THRESHOLD` | unset (not sent) | Similarity threshold from 0 to 1 passed to Reflexio's `/api/search`. Unset, empty, or invalid leaves the server's embedding default in place. Hook env. |
 | `CLAUDE_SMART_STATE_DIR` | `~/.claude-smart/sessions/` | Where the per-session JSONL buffer lives. |
 | `CLAUDE_SMART_NODE_LTS_MAJOR` | `22` | Major version used when the installer downloads private Node.js/npm into `~/.claude-smart/node/current`. |
 | `CLAUDE_SMART_NODE_BASE_URL` | `https://nodejs.org/dist/latest-v${CLAUDE_SMART_NODE_LTS_MAJOR}.x` | Override the Node.js download base URL for tests, mirrors, or recovery. |
@@ -72,7 +73,78 @@ Tunables read by the plugin at runtime. Most users don't need to touch these —
 
 ## Embeddings
 
-claude-smart uses one shared local embedding daemon by default. The backend starts `reflexio embeddings serve` on `127.0.0.1:8072` when `CLAUDE_SMART_USE_LOCAL_EMBEDDING=1`, then every backend worker and host process calls its OpenAI-compatible `/v1/embeddings` endpoint instead of loading a model in each process.
+claude-smart uses one shared local inference daemon by default. Reflexio's launcher owns a local child when `REFLEXIO_EMBEDDING_SERVICE_URL` is unset; an explicit URL attaches to a separately owned process, including when that URL is loopback. Model selection and process ownership are separate: reranking can also use the shared daemon.
+
+`plugin/scripts/backend-inference-owner.py` asks the selected SDK launcher for that same ownership decision. Backend health/compatibility checks and stale-child cleanup follow it rather than `CLAUDE_SMART_USE_LOCAL_EMBEDDING`. Attached inference does not require or clean up a child on the default loopback port. Unknown ownership reports degraded health and skips child cleanup. The shell accepts both LF and native Windows CRLF output. The decision is cached for one backend command, and the query does not create a missing environment file. It uses the backend launcher's plugin working directory and selected environment file, with implicit dotenv discovery blocked.
+
+`CLAUDE_SMART_USE_LOCAL_EMBEDDING` is retired. The selected embedding model owns execution, the explicit service URL owns attachment, and existing timeout settings retain their budgets. The installer checks local native dependencies only for a plugin-owned colocated inference process. The dashboard no longer offers a second embedding switch. Workers call the selected service's OpenAI-compatible `/v1/embeddings` endpoint instead of loading a model in each process.
+
+### Upgrade from the old embedding flag
+
+Before upgrading, record the effective embedding model, endpoint, provider and
+request timeout, and preserve any explicit values through their existing settings.
+Stop the local backend/dashboard before editing the selected `~/.claude-smart/.env`.
+Remove the retired assignment and parent-process exports; the bundled SDK rejects
+active old assignments, including blanks, before normal startup. No automatic
+configuration rewrite or permanent conversion command is installed.
+
+- False never meant embeddings off or prevented the SDK launcher from owning a
+  child. Removing it preserves model-based routing. Deliberate disabling uses
+  canonical `REFLEXIO_EMBEDDING_PROVIDER=off`.
+- Exact `1` and empty/default values made the old plugin shell choose
+  `local_service` before the SDK loaded canonical file settings. A written `off`
+  could be shadowed. To retain actual old behavior choose canonical local service;
+  to honor the written off deliberately keep off. Resolve that policy explicitly
+  before removing the old assignment; do not infer intent from the file alone.
+- Other truthy spellings, such as `true`, reached SDK normalization after file
+  loading and did not shadow a written provider in the same way. Preserve that
+  canonical setting. When no canonical setting existed, preserve the former local
+  preference with the existing `REFLEXIO_EMBEDDING_PROVIDER=local_service`.
+- Keep explicit cloud models and remote endpoints. A canonical remote service
+  defaults to two seconds, whereas direct library callers using the former flag
+  could default to 30 seconds. Preserve any required old/default/custom budget
+  explicitly with `REFLEXIO_EMBEDDING_SERVICE_TIMEOUT_MS`. Do not apply a raw
+  library migration blindly to plugin startup, which already normalized modes.
+
+The newer bundled SDK rejects retired field names in saved organization JSON.
+The bundled startup runner prepares supported previous-generation local files
+before its strict SQLite identity check. It preserves the old agent optimizer
+switches' conjunction in `agent_playbooks_enabled`, keeps independent user
+consent and custom budgets, and writes format metadata outside the logical
+configuration API. Normal reads reject the retired pair. An ambiguous unmarked
+file already containing the formerly ignored new name requires deliberate
+offline conversion; startup must not infer consent from it.
+
+The path pin uses the SDK's locked raw file edit, preserving extensions and an
+already selected database. Its legacy-versus-derived SQLite selection is
+unchanged. The actual requested backend port is checked before preparation,
+including forwarded `--backend-port`; an occupied port leaves the file alone.
+Stop old writers before upgrading: this check is not a reservation or a
+cross-port writer detector. A failed preparation or identity pin now aborts
+startup, preventing an unpinned resolver from choosing an empty derived file
+beside existing history. Fix the saved policy/permissions and retry rather than
+continuing into another database.
+
+Untagged SQLite still selects SQLite. If startup reports historical aliases such
+as `storage_type`, use its existing
+offline `python -m reflexio.cli config upgrade-file INPUT --output COPY` command with
+the plugin virtualenv Python. Keep the original, inspect the separate canonical
+copy (including the SQLite path and backend tag), then back up and replace the
+selected JSON only after verification. Stop services first. This operation does
+not migrate env files or choose a different database; the plugin retains its
+existing explicit legacy SQLite path pin after conversion.
+
+The launcher no longer exports the retired `INTERACTION_CLEANUP_THRESHOLD` or
+unused `INTERACTION_CLEANUP_DELETE_COUNT`. Local installation records its existing
+500-row interaction budget through `REFLEXIO_ROW_LIMIT_INTERACTIONS` only when
+that setting is absent. Preserve custom old caps with the canonical setting and
+remove old assignments before startup. Existing canonical file values are never
+replaced by a launcher default; zero still disables cap cleanup. This is retention
+compatibility for the SDK upgrade and earns no configuration-count reduction.
+
+The bundled old and new SDKs both choose MiniLM when the embedding model is
+unconfigured. Credential availability must not silently replace an explicit
+cloud model. The authenticated local-CLI opt-in remains independent.
 
 Supported local models are `local/nomic-embed-v1.5`, `local/nomic-embed-text-v1.5`, and `local/minilm-l6-v2`. The daemon owns exactly one model for its lifetime; start a second daemon on another port if you need to serve a different model concurrently.
 
@@ -163,6 +235,16 @@ and `~/.claude-smart/` is preserved.
 
 Installers and hook discovery use `CODEX_HOME` when set, falling back to `~/.codex`. Configuration, plugin caches, and hook trust remain in that account home. Run the installer with the same `CODEX_HOME` as the Codex session you want to update.
 
+The installer prepares the npm package at `$CODEX_HOME/claude-smart/runtime`
+(default `~/.codex/claude-smart/runtime`). Its `plugin/` owns the Python venv
+and dashboard dependencies/build. The marketplace and versioned plugin cache
+contain only package files: Codex validates their entire tree and rejects
+dependency symlinks such as `node_modules/.bin/acorn`. Patched hook commands
+pass `--runtime-root` to the external runner, overriding the cache path Codex
+supplies through `PLUGIN_ROOT`/`CLAUDE_PLUGIN_ROOT`. Reinstall/update uses the
+existing package lock, runtime reuse, and rollback mechanism; uninstall removes
+the account runtime along with the cache.
+
 `npx claude-smart uninstall --host codex` stops local claude-smart services and removes plugin/cache/config state; learned data under `~/.reflexio/` and `~/.claude-smart/` is preserved and shared with the other hosts.
 
 ### OpenCode
@@ -171,7 +253,7 @@ Installers and hook discovery use `CODEX_HOME` when set, falling back to `~/.cod
 
 **Runtime copy.** The installer copies the active package to `~/.claude-smart/opencode/claude-smart`, prepares that runtime immediately, and writes a `file://` plugin entry so OpenCode reloads the same prepared package after restart. It prepares claude-smart's runtime dependencies but expects the OpenCode CLI to already be installed; it resolves and records the OpenCode executable in `~/.claude-smart/.env` for later backend restarts. Set `CLAUDE_SMART_OPENCODE_PATH` before install if `opencode` is not on `PATH`.
 
-**Model selection.** OpenCode support uses OpenCode's plugin loader to inject relevant learned context before each model request. Learning extraction runs `opencode run --pure` from an isolated temp project, so it uses OpenCode's default model unless you set `CLAUDE_SMART_OPENCODE_MODEL=provider/model`. Set that env var if your normal project config pins a different provider or model.
+**Model selection.** OpenCode support uses OpenCode's plugin loader to inject relevant learned context before each model request. Learning extraction runs `opencode run` with `OPENCODE_PURE=1` from an isolated temp project. On OpenCode 1.x that skips external plugins; V2 has no pure mode, so there the extraction run loads the user's global plugins. Extraction uses OpenCode's default model unless you set `CLAUDE_SMART_OPENCODE_MODEL=provider/model`. Set that env var if your normal project config pins a different provider or model.
 
 **Windows.** On native Windows, install Git for Windows and make `bash.exe` available on `PATH` before starting OpenCode, or run OpenCode from WSL. The installer also checks the Windows local embedding runtime and writes actionable setup failures to `~/.claude-smart/install-failed`.
 
@@ -760,3 +842,63 @@ Retry tests replace the Stop handler's local time reference, not the global
 `time.sleep` function. Persistence/file-lock sleeps must not be counted as
 transcript retries. Native executable fallback tests run on the Windows and
 macOS dependency-platform jobs.
+
+## Optimizer backend binding
+
+Session hooks do not read or write Reflexio configuration. Configure
+`playbook_optimizer_config` through the server's configuration API/UI, including
+its enabled state, target/adoption permissions, quality and cost budgets, and
+assistant backend. The plugin does not replace these choices with local defaults
+or automatically activate optimization on a fresh server. Existing saved values
+remain unchanged, including disabled settings and external webhook backends.
+
+The installed `claude-smart-optimizer-assistant` console script still implements
+the Reflexio local-script protocol. For a server on the **same machine and user
+account**, the existing install-managed `~/.reflexio/plugin-root` link provides a
+stable route through plugin cache updates. Resolve `$HOME` to an absolute path
+when configuring `assistant_script_path`, for example
+`/home/alice/.reflexio/plugin-root/.venv/bin/claude-smart-optimizer-assistant` on
+POSIX. Do not send this client-machine path to a hosted/remote server; the
+executable must exist in the server's filesystem. On Windows the console script
+lives in `.venv/Scripts/claude-smart-optimizer-assistant.exe`; use the actual
+server-side absolute path (the installer may use `plugin-root.txt` when junctions
+are unavailable).
+
+The plugin does not rewrite historical absolute helper paths or reset other
+optimizer choices during an update. A previously configured version-specific
+path remains the server's binding and can become stale when that installation
+is removed. If that is already your saved binding, explicitly point it at the
+stable same-machine link or a separately managed server executable. This change
+does not repair an already-stale binding. The stable-link probe verifies helper
+execution after the normal link is refreshed, not a customer configuration
+migration or remote deployment.
+
+### Retrieval candidate budget
+
+The bundled SDK uses `retrieval_floor.candidate_pool_size`: zero disables
+cross-encoder flooring, and a positive value selects a candidate pool per search
+arm when the server reranker is available. Request top-k and recency pools can
+require more candidates. Other search thresholds remain independent.
+
+The server configuration page edits this budget directly, preserving nullable
+calibrated score floors, exact numeric overrides and opaque nested fields. It
+no longer turns a toggle into an arbitrary capacity or three fixed score values.
+An older connected server that does not return the canonical budget keeps the
+control disabled until upgraded; editing unrelated settings does not synthesize
+a new ignored candidate field for that server.
+
+SDK #813 owns local-file generation2 and targeted upgrades from generations0/1.
+The runner prepares before database identity pinning through the shared raw-file
+owner. Existing database selection, exact originals and inactive saved policies
+are preserved. An old-generation file already carrying the previously ignored
+candidate name requires deliberate explicit conversion. Publish/install of this
+plugin bundle is separate from source merge and is not performed by this change.
+
+
+The server settings editor uses the current singular `profile_extractor_config`
+and `user_playbook_extractor_config` objects. Editing a prompt preserves the
+other object fields; retired plural arrays are not interpreted as aliases. A
+blank or invalid candidate-budget edit blocks Save rather than disabling retrieval.
+Only explicit zero disables it. Help, stop and docs-only runner commands do not
+prepare, initialize, upgrade or pin a selected backend configuration; backend
+startup retains exact originals and database identity preparation.

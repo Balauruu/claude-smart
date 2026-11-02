@@ -5,8 +5,9 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:pa
 import { fileURLToPath } from "node:url"
 
 import { AssistantBuffer } from "./assistant-buffer.js"
-import { sessionIDFrom } from "./internal.js"
+import { eventProperties, sessionIDFrom } from "./internal.js"
 import { chatMessagePayload, eventPayload, stopPayload, toolAfterPayload } from "./payload.js"
+import { createSetup } from "./v2.js"
 
 type HookResult = Record<string, unknown>
 
@@ -165,6 +166,21 @@ function bashPath(): string | undefined {
 
 const RESOLVED_BASH = bashPath()
 
+// V1 hook entries are list entries: when OpenCode loads this module twice for
+// one directory (a config entry and a plugins-directory loader are two load
+// specs, and 1.x auto-loads the plugins directory as well), every instance's
+// hooks run and each turn publishes once per instance. The newest instance per
+// directory wins and earlier ones go inert — including on dispose, so a
+// superseded unload cannot stop services the survivor needs. The registry is
+// process-global because each load spec gets its own module instance.
+const LIVE_SERVERS_KEY = Symbol.for("claude-smart.opencode.live-servers")
+function liveServerTokens(): Map<string, symbol> {
+  const store = globalThis as unknown as Record<symbol, Map<string, symbol>>
+  let tokens = store[LIVE_SERVERS_KEY]
+  if (!tokens) tokens = store[LIVE_SERVERS_KEY] = new Map()
+  return tokens
+}
+
 function contextFrom(result: HookResult): string {
   const hookOutput = result.hookSpecificOutput
   if (!hookOutput || typeof hookOutput !== "object") return ""
@@ -236,6 +252,13 @@ async function server(input: PluginInput) {
   const completedAssistantText = new Map<string, string>()
   const assistant = new AssistantBuffer()
   const cwd = input.directory
+  const tokens = liveServerTokens()
+  const token = Symbol("claude-smart-server")
+  tokens.set(cwd, token)
+  const isLive = () => tokens.get(cwd) === token
+  // A superseded instance only serves sessions it admitted; anything else it
+  // would buffer but never flush or clear.
+  const serves = (sessionID: string) => isLive() || activeSessions.has(sessionID)
 
   async function flushStop(sessionID: string): Promise<void> {
     if (!sessionID || !activeSessions.has(sessionID)) return
@@ -253,8 +276,12 @@ async function server(input: PluginInput) {
   return {
     event: async ({ event }: EventInput) => {
       const type = event.type
-      assistant.update(event)
+      // Capture stays live for superseded instances, but only for sessions
+      // they admitted, so a V2 reload overlap still lets the old instance
+      // finish its ongoing turn.
+      if (serves(sessionIDFrom(eventProperties(event)))) assistant.update(event)
       if (type === "session.created") {
+        if (!isLive()) return
         const payload = eventPayload(event, cwd)
         const sessionID = String(payload.session_id || "")
         if (!sessionID) return
@@ -273,6 +300,7 @@ async function server(input: PluginInput) {
       }
     },
     "chat.message": async (hookInput: Record<string, unknown>, output: Record<string, unknown>) => {
+      if (!isLive()) return
       const payload = chatMessagePayload(hookInput, output, cwd)
       if (!payload.session_id || !payload.prompt) return
       activeSessions.add(String(payload.session_id || ""))
@@ -289,6 +317,10 @@ async function server(input: PluginInput) {
     "tool.execute.after": async (hookInput: Record<string, unknown>, output: Record<string, unknown>) => {
       const payload = toolAfterPayload(hookInput, output, cwd)
       if (!payload.session_id || !payload.tool_name) return
+      // A superseded instance keeps serving only the sessions it admitted
+      // (a V2 reload hands the slot to a new instance mid-turn); a plain
+      // double load never admitted any, so it stays silent.
+      if (!isLive() && !activeSessions.has(String(payload.session_id))) return
       await runScript(HOOK_ENTRY, ["opencode", "post-tool"], payload)
     },
     "experimental.text.complete": async (
@@ -296,13 +328,18 @@ async function server(input: PluginInput) {
       output: { text?: string },
     ) => {
       const sessionID = typeof hookInput.sessionID === "string" ? hookInput.sessionID : ""
-      if (!sessionID) return
+      if (!sessionID || !serves(sessionID)) return
       if (typeof output.text === "string") completedAssistantText.set(sessionID, output.text)
     },
     dispose: async () => {
+      // Flush in-flight sessions even when superseded (a reload hands the slot
+      // over mid-turn), but leave the services to the live instance.
       await Promise.all([...activeSessions].map((sessionID) => flushStop(sessionID)))
+      if (!isLive()) return
       await runService(DASHBOARD_SERVICE, "session-end")
       await runService(BACKEND_SERVICE, "session-end")
+      // Re-check: a newer instance may have taken the slot mid-dispose.
+      if (isLive()) tokens.delete(cwd)
     },
   }
 }
@@ -310,4 +347,6 @@ async function server(input: PluginInput) {
 export default {
   id: "claude-smart",
   server,
+  // V1 calls server(). OpenCode V2 reads setup() and ignores server().
+  setup: createSetup(server),
 }
