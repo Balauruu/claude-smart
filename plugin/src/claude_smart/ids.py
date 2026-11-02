@@ -28,30 +28,55 @@ _LOGGER = logging.getLogger(__name__)
 _USER_ID_OVERRIDE_ENV = "REFLEXIO_USER_ID"
 
 
-def _as_path(path: str | os.PathLike[str]) -> Path | PureWindowsPath:
-    """Return ``path`` as a path object, keeping native Windows paths under Git Bash."""
-    text = os.fspath(path)
-    if "\\" in text or (len(text) >= 2 and text[0].isalpha() and text[1] == ":"):
-        return PureWindowsPath(text)
-    return Path(text)
-
-
 def _basename(path: str | os.PathLike[str]) -> str:
     """Return a cwd basename, including native Windows paths under Git Bash."""
-    return _as_path(path).name or "unknown-project"
+    text = os.fspath(path)
+    if "\\" in text or (len(text) >= 2 and text[0].isalpha() and text[1] == ":"):
+        return PureWindowsPath(text).name or "unknown-project"
+    return Path(path).name or "unknown-project"
 
 
-def _main_worktree_basename(common_dir: str) -> str | None:
-    """Return the main worktree's basename when ``common_dir`` is its ``.git``.
-
-    Linked worktrees (``git worktree add``) share the main checkout's git dir,
-    so its parent names the project. Submodules and bare repos have a common
-    dir that is not called ``.git``; they return ``None``.
-    """
-    path = _as_path(common_dir)
-    if path.name != ".git":
+def _git_lines(base: Path, *args: str) -> list[str] | None:
+    """Return the output lines of ``git <args>`` run in ``base``, or None on failure."""
+    result = subprocess.run(  # noqa: S603 — fixed argv, cwd is a Path.
+        ["git", *args],  # noqa: S607
+        cwd=base,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    if result.returncode != 0:
         return None
-    return path.parent.name or None
+    return [line.strip() for line in result.stdout.strip().splitlines()]
+
+
+def _linked_worktree_main_basename(base: Path) -> str | None:
+    """Return the main worktree's basename when ``base`` is in a linked worktree.
+
+    A linked worktree (``git worktree add``, used by Claude Code for
+    ``.claude/worktrees/<name>`` sessions) has its own git dir under the main
+    repo's common dir, so the two differ. Every other checkout (the main
+    worktree, a submodule, a ``--separate-git-dir`` checkout) has equal git and
+    common dirs and returns None, keeping its toplevel id. The main worktree is
+    taken from ``git worktree list``, which always lists it first; a bare main
+    repo has no checkout to name, so it returns None too.
+    """
+    dirs = _git_lines(base, "rev-parse", "--git-dir", "--git-common-dir")
+    if not dirs or len(dirs) != 2:
+        return None
+    git_dir, common_dir = ((base / d).resolve() for d in dirs)
+    if git_dir == common_dir:
+        return None
+    listing = _git_lines(base, "worktree", "list", "--porcelain")
+    if (
+        not listing
+        or len(listing) < 2
+        or not listing[0].startswith("worktree ")
+        or listing[1] == "bare"
+    ):
+        return None
+    return _basename(listing[0][len("worktree ") :])
 
 
 def resolve_project_id(cwd: str | os.PathLike[str] | None = None) -> str:
@@ -60,11 +85,11 @@ def resolve_project_id(cwd: str | os.PathLike[str] | None = None) -> str:
     Local and managed/API-key installs both use the git/project name as
     Reflexio's ``user_id``.
 
-    Prefers the basename of the main worktree, so linked worktrees (for
-    example ``<repo>/.claude/worktrees/<name>``) and `cd src/` all map to the
-    same project. Submodules and repos without a ``.git`` dir use the basename
-    of their own toplevel. Falls back to the cwd basename when the directory is
-    not inside a git repo.
+    Inside a linked worktree (for example ``<repo>/.claude/worktrees/<name>``)
+    this is the basename of the main worktree, so worktree sessions share the
+    project's learnings. Otherwise it is the basename of the git toplevel, so
+    submodules keep their own id and `cd src/` maps to the same project. Falls
+    back to the cwd basename when the directory is not inside a git repo.
 
     Args:
         cwd: Working directory to resolve. Defaults to ``os.getcwd()``.
@@ -74,41 +99,12 @@ def resolve_project_id(cwd: str | os.PathLike[str] | None = None) -> str:
     """
     base = Path(cwd) if cwd is not None else Path.cwd()
     try:
-        result = subprocess.run(  # noqa: S603, S607 — fixed argv, cwd is a Path.
-            [  # noqa: S607
-                "git",
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-                "--show-toplevel",
-            ],
-            cwd=base,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
-        if len(lines) == 2:
-            common_dir, toplevel = (line.strip() for line in lines)
-            main = _main_worktree_basename(common_dir)
-            if main:
-                return main
-            if toplevel:
-                return _basename(toplevel)
-        # git < 2.31 has no --path-format; fall back to the plain toplevel.
-        result = subprocess.run(  # noqa: S603, S607 — fixed argv, cwd is a Path.
-            ["git", "rev-parse", "--show-toplevel"],  # noqa: S607
-            cwd=base,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            toplevel = result.stdout.strip()
-            if toplevel:
-                return _basename(toplevel)
+        main = _linked_worktree_main_basename(base)
+        if main:
+            return main
+        toplevel = _git_lines(base, "rev-parse", "--show-toplevel")
+        if toplevel and toplevel[0]:
+            return _basename(toplevel[0])
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
         _LOGGER.debug("git toplevel resolution failed: %s", exc)
     return _basename(cwd) if cwd is not None else _basename(base)
